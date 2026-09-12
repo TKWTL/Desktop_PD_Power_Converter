@@ -9,17 +9,32 @@ extern "C" {
 
 /* Board power policy. */
 #define PD_REQUEST_MAX_FIXED_MV         20000U
-/* SPR current ceiling.  Requesting more than 3 A without a verified 5 A
- * e-marked cable is what a Sink must never do: the cable and the Source's
- * output give way first (observed: 20 V rail sagging to 16.5 V, Source
- * answering every PS_RDY with a Hard Reset, endless re-attach loop).  Getting
- * to 5 A safely needs SOP' cable discovery, which is not implemented yet, so
- * SPR stays at 3 A; the 140 W path is EPR (the Source is cable-aware there). */
-#define PD_SPR_REQUEST_MAX_MA           3000U
+/* SPR current ceiling: request the Source's full advertised current.
+ *
+ * Product policy is maximum power in every scenario.  The board is field-
+ * tested with a 5 A e-marked cable (the verified reference flow on this
+ * charger is itself SPR 20 V / 5 A -> EPR -> 28 V / 5 A), and the old "5 A
+ * request collapsed the rail" scare was the PHY deadline bug, not the cable.
+ * This constant only clamps runaway PDO values; the actual request is always
+ * min(PDO current, this). */
+#define PD_SPR_REQUEST_MAX_MA           5000U
 #define PD_EPR_ENABLE                   1U
 #define PD_EPR_TARGET_MV                28000U
 #define PD_EPR_REQUEST_MAX_MA           5000U
 #define PD_EPR_SINK_PDP_W               140U
+
+/* USB identity VDO values, kept for a future identity experiment.
+ *
+ * The current build deliberately does NOT answer VDM identity requests with
+ * these values: it mirrors the field-verified DemoBoard behaviour (short NAK)
+ * because the crafted ACK was followed by this charger withholding the EPR
+ * grant, while the verified build never supplies a real identity at all.
+ * Values remain here (pid.codes open-project test assignment - replace before
+ * shipping) for the case that a real identity exchange turns out to be
+ * required after all. */
+#define PD_IDENTITY_VID                0x1209U
+#define PD_IDENTITY_PID                0x0001U
+#define PD_IDENTITY_BCD_DEVICE         0x0001U
 
 /* Public PD service API.  Protocol state, timers, PHY access and EPR chunking
  * are internal to Peripheral/PD. */

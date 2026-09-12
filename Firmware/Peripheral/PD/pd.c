@@ -28,16 +28,28 @@
 #define PD_EPR_MODE_EXIT                  5U
 #define PD_EXT_CHUNK_DATA_MAX             26U
 #define PD_EPR_CAP_BUFFER_SIZE            64U
-/* After EPR_Mode Enter_Succeeded the Sink must send EPR_Get_Source_Cap right
- * away.  A 120 ms wait (plus the prints around it) let the Source hard-reset
- * first: the log showed "Enter Succeeded" immediately followed by "Source Hard
- * Reset", and even 2 ms lost that race.  Send it as soon as the next
- * PD_EPR_Task pass runs - the only intentional delay left is the PHY's own
- * frame gap in pd_port.c. */
-#define PD_EPR_GET_CAP_DELAY_MS           0U
+/* Fallback gap between EPR_Mode Enter_Succeeded and the first
+ * EPR_Get_Source_Cap; used only when the immediate send from the
+ * Enter_Succeeded handler could not start (PHY busy).
+ *
+ * Do NOT raise this.  Field logs on this charger (Lenovo C140) show a Get
+ * sent 120 ms after Enter Succeeded being ignored outright - nine frame
+ * attempts, zero GoodCRC (TO=0/3/0 -> 0/6/0 -> 0/9/0) - followed by a Source
+ * Hard Reset and a full port power-flap, while an immediate Get under the
+ * same conditions is served.  Keep the gap small: just enough to stay out of
+ * our own auto-GoodCRC window. */
+#define PD_EPR_GET_CAP_DELAY_MS           2U
 /* Some Sources answer EPR_Get_Source_Cap late; the old 500 ms bail-out made us
  * send EPR_Mode(Exit) before the caps had a chance to arrive. */
 #define PD_EPR_SOURCE_CAP_TIMEOUT_MS      1200U
+/* The Source can be busy (internal rail / cable work) for a while right after
+ * Enter_Succeeded and miss the first EPR_Get_Source_Cap outright: with the
+ * same firmware, field runs either got the first Get acknowledged or none of
+ * its three frame attempts.  Retry the Get spaced out (RX stays armed in
+ * between, a recovering Source may also send the caps by itself) and only
+ * fall back to SPR when the tries are used up. */
+#define PD_EPR_GET_MAX_TRIES              6U
+#define PD_EPR_GET_RETRY_GAP_MS           250U
 #define PD_EPR_ENTER_TIMEOUT_MS           550U
 #define PD_EPR_KEEPALIVE_PERIOD_MS        375U
 #define PD_EPR_KEEPALIVE_ACK_TIMEOUT_MS   100U
@@ -133,6 +145,7 @@ static __IO UINT8  PD_ProtocolRecoveryCount;
 static __IO UINT8 PD_TxJob;
 static __IO UINT8  PD_EPR_FailedForAttach;
 static __IO UINT8  PD_EPR_GetCapSent;
+static UINT8 PD_EPR_GetCapTries;
 static __IO UINT8  PD_EPR_KeepAliveWaitAck;
 static UINT16 PD_EPR_TimerMs;
 static UINT16 PD_EPR_KeepAliveMs;
@@ -208,6 +221,13 @@ static void PD_SINK_Init( )
  */
 static void PD_PHY_Reset( void )
 {
+    static UINT16 resets;
+
+    /* One line per link reset: together with the reason printed by the caller
+     * it pins down what happened immediately before Connected was cleared. */
+    printf("[PD] PHY reset #%u (EPR state=%u)\r\n",
+           (unsigned)(++resets), (unsigned)PD_EPR_State);
+
     PD_Port_AbortTx();
     /* Drop any policy context tied to a transmission that no longer exists. */
     PD_TxJob = PD_TXJOB_NONE;
@@ -241,6 +261,7 @@ static void PD_PHY_Reset( void )
      * SPR -> EPR -> Hard Reset -> SPR power-flap loop.  It is released only
      * by a real re-plug (see PD_Det_Proc). */
     PD_EPR_GetCapSent = 0;
+    PD_EPR_GetCapTries = 0;
     PD_EPR_KeepAliveWaitAck = 0;
     PD_EPR_TimerMs = 0;
     PD_EPR_KeepAliveMs = 0;
@@ -453,16 +474,17 @@ static UINT8 PD_Send_Handle( const UINT8 *pbuf, UINT8 len, UINT8 job )
     /* Hand the frame to the USBPD dedicated DMA.  From here on the USBPD IRQ
      * owns it (IF_TX_END -> RX turnaround -> Source GoodCRC -> result) and the
      * completion is dispatched by PD_TxCompletion_Proc() with PD_TxJob as the
-     * caller's context.  No busy-wait, no IRQ mask, no scheduler stall. */
+     * caller's context.  No busy-wait, no IRQ mask, no scheduler stall.
+     *
+     * The Message ID is deliberately NOT advanced here.  It moves only when the
+     * transaction is over (GoodCRC received, or the retries are exhausted), so
+     * a PHY retry keeps using the frame the Source may already have seen. */
+    PD_TxJob = job;
     if(!PD_Port_StartTx(PD_Tx_Buf, (UINT8)(len + 2u), 1u))
     {
+        PD_TxJob = PD_TXJOB_NONE;
         return DEF_PD_TX_FAIL;
     }
-
-    /* The Message ID is on the wire now: advance it immediately so a PHY
-     * retry never re-uses an ID the Source may already have seen. */
-    PD_Ctl.Msg_ID += 2;
-    PD_TxJob = job;
 
     return DEF_PD_TX_OK;
 }
@@ -673,6 +695,21 @@ static UINT8 PD_Select_Highest_Fixed_PDO(void)
 static void PD_Print_Source_PDOs(void)
 {
     UINT8 i;
+    static UINT8 printed_tables;
+
+    /* The full table is six lines.  Printing it on every re-negotiation fills
+     * the 256-byte USART ring and the driver then drops lines - which is how
+     * the decisive "who reset the link" evidence disappeared from earlier
+     * captures.  Keep the first two tables of a session complete, afterwards
+     * only a one-line summary. */
+    if(printed_tables >= 2u)
+    {
+        printf("[PD] Source_Capabilities: %u PDO(s) (table already printed)\r\n",
+               (unsigned)PD_SourcePDO_Count);
+        return;
+    }
+    printed_tables++;
+
     printf("[PD] Source_Capabilities: %u PDO(s); fixed-request policy max %u mV:\r\n",
            PD_SourcePDO_Count, (unsigned)PD_REQUEST_MAX_FIXED_MV);
 
@@ -821,6 +858,8 @@ static void PD_EPR_Fallback(const char *reason)
     PD_EPR_ModeActive = 0;
     PD_EPR_ContractActive = 0;
     PD_EPR_GetCapSent = 0;
+    PD_EPR_GetCapTries = 0;
+    PD_EPR_CapDataSize = 0;
     PD_EPR_KeepAliveWaitAck = 0;
     PD_EPR_TimerMs = 0;
     PD_EPR_KeepAliveMs = 0;
@@ -839,12 +878,31 @@ static void PD_EPR_Exit_To_SPR(const char *reason)
 static void PD_TxCompletion_Proc(void)
 {
     UINT8 result = PD_Port_GetTxResult();
+    UINT8 job;
+
+    if((result != PD_PORT_TX_RESULT_OK) && (result != PD_PORT_TX_RESULT_ERR))
+        return;
+
+    PD_Port_ClearTxResult();
+
+    /* Take the finished job out before dispatching it: several failure handlers
+     * below start a new transmission (PD_EPR_Exit_To_SPR() sends EPR_Mode Exit,
+     * for example), and that fresh PD_TxJob must not be wiped by this frame's
+     * bookkeeping - the old code assigned PD_TXJOB_NONE after the switch and
+     * silently killed the follow-up transaction's context. */
+    job = PD_TxJob;
+    PD_TxJob = PD_TXJOB_NONE;
+
+    /* Advance the Message ID when the transaction ends, never at send time: a
+     * PHY retry keeps the ID the Source may already have seen, and the next
+     * message cannot be taken for a duplicate.  Hard Reset carries no header
+     * and is sent without a job, so it does not consume an ID. */
+    if(job != PD_TXJOB_NONE)
+        PD_Ctl.Msg_ID = (UINT8)((PD_Ctl.Msg_ID + 2u) & 0x0Eu);
 
     if(result == PD_PORT_TX_RESULT_OK)
     {
-        PD_Port_ClearTxResult();
-
-        switch(PD_TxJob)
+        switch(job)
         {
             case PD_TXJOB_GET_SRC_CAP:
                 PD_GetSrcCap_Sent = 1u;
@@ -852,20 +910,23 @@ static void PD_TxCompletion_Proc(void)
                 break;
 
             case PD_TXJOB_EPR_GET_CAP:
-                printf("[PD] EPR_Get_Source_Cap sent\r\n");
+                printf("[PD] EPR_Get_Source_Cap sent (try %u)\r\n",
+                       (unsigned)PD_EPR_GetCapTries);
                 PD_EPR_TimerMs = 0;
+                break;
+
+            case PD_TXJOB_EPR_REQ:
+                /* The Source answers with Accept/PS_RDY (or Reject); until then
+                 * this line marks that the 28 V request is on the wire. */
+                printf("[PD] EPR_Request sent; waiting for Accept\r\n");
                 break;
 
             default:
                 break;
         }
-
-        PD_TxJob = PD_TXJOB_NONE;
     }
-    else if(result == PD_PORT_TX_RESULT_ERR)
+    else
     {
-        PD_Port_ClearTxResult();
-
         {
             PD_Port_PhyDiag phy;
             PD_Port_GetPhyDiag(&phy);
@@ -873,7 +934,7 @@ static void PD_TxCompletion_Proc(void)
              * tells "PHY never finished the frame" apart from "partner never
              * acknowledged it" instead of blaming the PHY for both. */
             printf("[PD] TX failed (job=%u) ST=%02X CNT=%u\r\n",
-                   (unsigned)PD_TxJob, (unsigned)phy.status,
+                   (unsigned)job, (unsigned)phy.status,
                    (unsigned)phy.bmc_byte_count);
             printf("[PD] TX phy TO=%u/%u/%u CC%u CFG=%04X\r\n",
                    (unsigned)phy.tx_end_timeouts,
@@ -882,7 +943,7 @@ static void PD_TxCompletion_Proc(void)
                    (unsigned)phy.selected_cc, (unsigned)phy.config);
         }
 
-        switch(PD_TxJob)
+        switch(job)
         {
             case PD_TXJOB_REQUEST:
                 if(PD_Port_HardResetPending())
@@ -907,7 +968,28 @@ static void PD_TxCompletion_Proc(void)
                 break;
 
             case PD_TXJOB_EPR_GET_CAP:
-                PD_EPR_Exit_To_SPR("EPR_Get_Source_Cap TX failed");
+                /* The Source can be busy/deaf for a while right after
+                 * Enter_Succeeded (same firmware: sometimes the first Get is
+                 * acknowledged, sometimes none of its frame attempts are).
+                 * Retry with a gap instead of dropping EPR; only leave when
+                 * the try budget is used up.  A failure while caps are already
+                 * arriving / the session moved on is stale - ignore it. */
+                if((PD_EPR_State == EPR_ST_WAIT_SOURCE_CAP) &&
+                   (PD_EPR_CapDataSize == 0u))
+                {
+                    PD_EPR_GetCapSent = 0;
+                    PD_EPR_TimerMs = 0;
+                    if(PD_EPR_GetCapTries < PD_EPR_GET_MAX_TRIES)
+                        printf("[PD] EPR_Get_Source_Cap TX failed; retrying (%u/%u)\r\n",
+                               (unsigned)PD_EPR_GetCapTries, (unsigned)PD_EPR_GET_MAX_TRIES);
+                    else
+                        PD_EPR_Exit_To_SPR("EPR_Get_Source_Cap TX failed");
+                }
+                else
+                {
+                    printf("[PD] stale EPR_Get_Source_Cap failure ignored (EPRst=%u)\r\n",
+                           (unsigned)PD_EPR_State);
+                }
                 break;
 
             case PD_TXJOB_EPR_CHUNK:
@@ -931,8 +1013,6 @@ static void PD_TxCompletion_Proc(void)
             default:
                 break;
         }
-
-        PD_TxJob = PD_TXJOB_NONE;
     }
 }
 
@@ -1043,6 +1123,12 @@ static UINT8 PD_Send_EPR_Request_Fixed(UINT8 pdo_index)
     UINT32 rdo;
     UINT16 units = (UINT16)(PD_Selected_mA / 10u);
 
+    /* Field set identical to the DemoBoard build that is field-verified on
+     * this very charger (Lenovo C140 -> stable 28 V): Object Position, No USB
+     * Suspend (B24), EPR Capable (B22), operating/maximum current in 10 mA
+     * units.  B25 (USB Communications Capable) stays 0 - the verified build
+     * leaves it clear; it was added here only for parity with a different
+     * reference and is a byte-level deviation from the working frame. */
     rdo = ((UINT32)(pdo_index & 0x0Fu) << 28) |
           (1UL << 24) |                 /* No USB Suspend */
           (1UL << 22) |                 /* EPR Mode Capable */
@@ -1050,7 +1136,13 @@ static UINT8 PD_Send_EPR_Request_Fixed(UINT8 pdo_index)
           (UINT32)(units & 0x03FFu);
 
     PD_WriteU32LE(&payload[0], rdo);
-    PD_WriteU32LE(&payload[4], PD_EPR_SelectedRawPDO); /* exact PDO copy */
+    /* Second data object: the selected source PDO verbatim.  Measured against
+     * the Source, this is the form it accepts at the link layer: with NDO = 2
+     * it acknowledges the frame and stays silent (it never grants), while
+     * dropping to the RDO alone (NDO = 1) makes it answer with an immediate
+     * Hard Reset - i.e. it treats the shorter message as invalid.  Keep NDO=2
+     * until a capture of a known-good Sink exchanging EPR says otherwise. */
+    PD_WriteU32LE(&payload[4], PD_EPR_SelectedRawPDO);
 
     PD_Load_Header(0x00, DEF_TYPE_EPR_REQUEST);
     return PD_Send_Handle(payload, 8, PD_TXJOB_EPR_REQ);
@@ -1203,6 +1295,16 @@ static void PD_Handle_Extended_Message(UINT8 msg_type)
                 PD_EPR_KeepAliveWaitAck = 0;
                 PD_EPR_KeepAliveAckMs = 0;
             }
+            else if(PD_RxWarnCount < 12u)
+            {
+                /* Any other Extended Control request (EPR_Get_Sink_Cap,
+                 * Get_Status, ...) is not answered by this build.  It used to
+                 * vanish without a trace - no reply and no log line - which
+                 * reads exactly like "the Source stayed silent".  Surface it. */
+                PD_RxWarnCount++;
+                printf("[PD] RX ext ctrl type=%u not answered\r\n",
+                       (unsigned)ctrl_type);
+            }
         }
     }
     else if(PD_RxWarnCount < 12u)
@@ -1245,11 +1347,28 @@ static void PD_Handle_EPR_Mode_Message(void)
             PD_EPR_State = EPR_ST_WAIT_SOURCE_CAP;
             PD_EPR_TimerMs = 0;
             PD_EPR_GetCapSent = 0;
+            PD_EPR_GetCapTries = 0;
+            PD_EPR_CapDataSize = 0;
+            PD_EPR_LastChunk = 0;
             /* Start the KeepAlive duty from zero so the first one leaves 375 ms
              * after the Source confirmed the EPR entry. */
             PD_EPR_KeepAliveMs = 0;
             PD_EPR_KeepAliveWaitAck = 0;
             PD_EPR_KeepAliveAckMs = 0;
+
+            /* Send the Get from here, in the same policy pass that consumed
+             * Enter_Succeeded: this charger serves a Get that goes out within
+             * a few milliseconds and ignores one that arrives at ~120 ms
+             * (nine unacknowledged frames, then Hard Reset).  The EPR task
+             * keeps the retries: if this call fails to start, or the GoodCRC
+             * never comes, PD_TxCompletion_Proc() clears GetCapSent and the
+             * task re-sends after PD_EPR_GET_CAP_DELAY_MS. */
+            if(PD_Send_Extended_Control(PD_EXT_CTRL_EPR_GET_SOURCE_CAP,
+                                        PD_TXJOB_EPR_GET_CAP) == DEF_PD_TX_OK)
+            {
+                PD_EPR_GetCapSent = 1;
+                PD_EPR_GetCapTries = 1;
+            }
         }
         else
         {
@@ -1297,23 +1416,28 @@ static void PD_Main_Proc( )
         PD_Port_PhyDiag hr;
         PD_Port_GetPhyDiag(&hr);
 
-        /* A Hard Reset terminates the whole protocol session.  Do not let a
-         * message event captured just before/alongside IF_RX_RESET be parsed
-         * after the session state has been cleared: that can otherwise turn a
-         * stale PS_RDY into a fake PDO0 contract. */
         PD_Port_ClearHardResetEvent();
-        PD_Port_ClearMessageEvent();
-        /* ST/CNT tell real Hard Resets (SOP1 reset ordered set, no data objects)
-         * apart from RX errors that only raised IF_RX_RESET. */
-        printf("[PD] Source Hard Reset received (ST=%u CNT=%u); contract invalid, re-arming Sink\r\n",
-               (unsigned)hr.hr_pd_stat, (unsigned)hr.hr_byte_count);
-        /* A Source that aborts an in-flight EPR session with a Hard Reset must
-         * not be asked again for this attachment (the charger tested kept
-         * Hard-Resetting right after Enter_Succeeded, producing an endless
-         * SPR -> EPR -> HR power-flap loop). */
-        if(PD_EPR_State != EPR_ST_OFF)
-            PD_EPR_FailedForAttach = 1u;
-        PD_PHY_Reset();
+        /* ST / CNT / EPRst identify the event in the field log; "session kept"
+         * marks the non-destructive handling below. */
+        printf("[PD] IF_RX_RESET: ST=%u CNT=%u VBUS=%u mV EPRst=%u (session kept)\r\n",
+               (unsigned)hr.hr_pd_stat, (unsigned)hr.hr_byte_count,
+               (unsigned)s_pd_vbus_mv, (unsigned)PD_EPR_State);
+
+        /* Do NOT tear the session down any more.  Field evidence (2026-09-12):
+         * this event arrives as ST=2 (SOP1/reset), CNT=0 with VBUS unchanged
+         * at ~19.9 V, at EPR exchange boundaries - and the Source keeps
+         * sending EPR messages right after it (the caps chunks continued after
+         * the first event).  A port Hard Reset would have removed VBUS and
+         * stopped the exchange, so these are cable-domain resets or line
+         * artefacts.  The PHY reset + FailedForAttach this handler used to do
+         * is what destroyed the very handshake it interrupted (the second
+         * event killed the exchange waiting for Accept, and earlier rounds got
+         * the endless SPR -> EPR -> reset power-flap from it).
+         * Keep the protocol state and any pending message; only re-arm the
+         * receiver.  A genuine Hard Reset still reaches recovery through VBUS:
+         * the Source removes power, the VBUS tracking owns the detach path,
+         * and its restart is followed by fresh Source_Capabilities that
+         * renegotiate the contract. */
         PD_Rx_Mode();
         return;
     }
@@ -1337,11 +1461,13 @@ static void PD_Main_Proc( )
     if(PD_EPR_State != EPR_ST_OFF)
         PD_EPR_TimerMs = (UINT16)(PD_EPR_TimerMs + Tmr_Ms_Dlt);
 
-    /* EPR mode must be maintained from Enter_Succeeded onwards, not only once
-     * the 28 V contract exists: the Source drops EPR (seen as a Hard Reset)
-     * when no EPR_KeepAlive arrives for ~500 ms, and the caps acquisition
-     * phase alone can last longer than that. */
-    if(PD_EPR_ModeActive)
+    /* KeepAlive maintains an *existing* EPR contract, so it is gated on the
+     * contract state (EPR_ST_ACTIVE) - the same condition the WCH reference
+     * uses.  Gating it on PD_EPR_ModeActive made it start at Enter_Succeeded,
+     * i.e. while the EPR_Request was still awaiting Accept/PS_RDY: the field
+     * log shows the Source then staying silent until our own 506 ms response
+     * timeout tore the session down. */
+    if(PD_EPR_State == EPR_ST_ACTIVE)
     {
         PD_EPR_KeepAliveMs = (UINT16)(PD_EPR_KeepAliveMs + Tmr_Ms_Dlt);
         if(PD_EPR_KeepAliveWaitAck)
@@ -1372,14 +1498,31 @@ static void PD_Main_Proc( )
     {
         PD_EPR_Fallback("EPR Mode entry timeout");
     }
-    else if(PD_EPR_State == EPR_ST_WAIT_SOURCE_CAP)
+
+    /* Deliberately a separate test, not an "else" of the branch above:
+     * EPR_ModeActive is already set when the Source confirms the entry, so an
+     * else-chain would make this state - and the EPR_Get_Source_Capabilities
+     * that has to leave from it - unreachable. */
+    if(PD_EPR_State == EPR_ST_WAIT_SOURCE_CAP)
     {
-        if(!PD_EPR_GetCapSent && PD_EPR_TimerMs > PD_EPR_GET_CAP_DELAY_MS)
+        /* The first Get leaves right after Enter_Succeeded (tries == 0 unless
+         * the message handler already sent it).  Later tries are spaced out so
+         * a Source that is briefly busy still gets caught once it listens
+         * again; RX stays armed between tries, so caps sent on the Source's
+         * own initiative are consumed too. */
+        if(!PD_EPR_GetCapSent &&
+           ((PD_EPR_GetCapTries == 0u)
+                ? (PD_EPR_TimerMs > PD_EPR_GET_CAP_DELAY_MS)
+                : (PD_EPR_TimerMs > PD_EPR_GET_RETRY_GAP_MS)))
         {
             PD_EPR_GetCapSent = 1;
+            PD_EPR_GetCapTries++;
             if(PD_Send_Extended_Control(PD_EXT_CTRL_EPR_GET_SOURCE_CAP, PD_TXJOB_EPR_GET_CAP) != DEF_PD_TX_OK)
             {
-                PD_EPR_Exit_To_SPR("EPR_Get_Source_Cap TX failed");
+                PD_EPR_GetCapSent = 0;
+                PD_EPR_TimerMs = 0;
+                if(PD_EPR_GetCapTries >= PD_EPR_GET_MAX_TRIES)
+                    PD_EPR_Exit_To_SPR("EPR_Get_Source_Cap TX failed");
             }
             /* "sent" print + timer reset happen in PD_TxCompletion_Proc()
              * when the Source's GoodCRC has arrived. */
@@ -1391,7 +1534,15 @@ static void PD_Main_Proc( )
             printf("[PD] EPR caps timeout: RX total=%u last ext=%u type=0x%02X ndo=%u\r\n",
                    (unsigned)PD_RxCount, (unsigned)PD_RxLast_Ext,
                    (unsigned)PD_RxLast_Type, (unsigned)PD_RxLast_Ndo);
-            PD_EPR_Exit_To_SPR("EPR_Source_Capabilities timeout");
+            /* ACKed but no caps yet: another Get within the try budget instead
+             * of leaving EPR on the first deadline. */
+            PD_EPR_GetCapSent = 0;
+            PD_EPR_TimerMs = 0;
+            if(PD_EPR_GetCapTries >= PD_EPR_GET_MAX_TRIES)
+                PD_EPR_Exit_To_SPR("EPR_Source_Capabilities timeout");
+            else
+                printf("[PD] EPR caps missing; retrying Get (%u/%u)\r\n",
+                       (unsigned)PD_EPR_GetCapTries, (unsigned)PD_EPR_GET_MAX_TRIES);
         }
     }
 
@@ -1456,10 +1607,21 @@ static void PD_Main_Proc( )
         case STA_RX_ACCEPT_WAIT:
         case STA_RX_PS_RDY_WAIT:
             PD_Ctl.PD_Comm_Timer += Tmr_Ms_Dlt;
-            if(PD_Ctl.PD_Comm_Timer > 499)
+            /* EPR requests are answered far later than an SPR handshake: the
+             * Source ramps 20 V -> 28 V before it sends PS_RDY, and a slow
+             * charger can stretch Accept -> PS_RDY well past the SPR window.
+             * The reference Sink on this PHY does not time these EPR waits out
+             * at all - it keeps waiting for the messages.  Keep the half-second
+             * fuse for SPR, but give an in-flight EPR exchange seconds so a
+             * late-but-valid PS_RDY is accepted instead of triggering the
+             * Soft Reset cascade. */
+            if(PD_Ctl.PD_Comm_Timer >
+               (((PD_EPR_State == EPR_ST_WAIT_REQUEST_ACCEPT) ||
+                 (PD_EPR_State == EPR_ST_WAIT_REQUEST_PSRDY)) ? 3000u : 499u))
             {
-                printf("[PD] response timeout in state %u after %u ms; trying Soft Reset\r\n",
-                       (unsigned)PD_Ctl.PD_State, (unsigned)PD_Ctl.PD_Comm_Timer);
+                printf("[PD] response timeout in state %u after %u ms (RX=%u last=0x%02X); trying Soft Reset\r\n",
+                       (unsigned)PD_Ctl.PD_State, (unsigned)PD_Ctl.PD_Comm_Timer,
+                       (unsigned)PD_RxCount, (unsigned)PD_RxLast_Type);
                 PD_Ctl.Flag.Bit.Stop_Det_Chk = 0;
                 PD_SoftResetRecoveryPending = 1u;
                 PD_Ctl.PD_State = STA_TX_SOFTRST;
@@ -1615,7 +1777,14 @@ static void PD_Main_Proc( )
                     else
                     {
                         if(PD_EPR_State == EPR_ST_WAIT_REQUEST_ACCEPT)
+                        {
                             PD_EPR_State = EPR_ST_WAIT_REQUEST_PSRDY;
+                            /* Make the Accept visible: the PS_RDY wait that
+                             * follows is the long one, and without this line a
+                             * stalled log cannot tell "Accept never arrived"
+                             * apart from "Accept consumed, PS_RDY missing". */
+                            printf("[PD] EPR Accept received; waiting for PS_RDY\r\n");
+                        }
                         PD_Ctl.PD_State = STA_RX_PS_RDY_WAIT;
                         PD_Ctl.PD_Comm_Timer = 0;
                     }
@@ -1678,6 +1847,17 @@ static void PD_Main_Proc( )
                     }
                     else if(PD_EPR_State == EPR_ST_WAIT_REQUEST_PSRDY)
                     {
+                        if(PD_Selected_mV <= 20000u)
+                        {
+                            /* This PS_RDY answers the SPR request that followed
+                             * a recovery, not the EPR request.  Consuming it as
+                             * the EPR contract left the port "EPR active" at
+                             * 20 V with KeepAlive running - exactly the
+                             * "stuck at 60 W" state seen in the field. */
+                            printf("[PD] EPR PS_RDY without a 28 V request; leaving EPR\r\n");
+                            PD_EPR_Exit_To_SPR(NULL);
+                            break;
+                        }
                         PD_SPR_ContractActive = 1;
                         PD_EPR_ContractActive = 1;
                         PD_EPR_ModeActive = 1;
@@ -1768,30 +1948,45 @@ static void PD_Main_Proc( )
                     if(PD_VDM_LogCount < 8u)
                     {
                         PD_VDM_LogCount++;
-                        printf("[PD] RX VDM: do0=%02X %02X %02X %02X\r\n",
+                        printf("[PD] RX VDM: %02X %02X %02X %02X cmd=%u\r\n",
                                (unsigned)PD_Rx_Buf[2], (unsigned)PD_Rx_Buf[3],
-                               (unsigned)PD_Rx_Buf[4], (unsigned)PD_Rx_Buf[5]);
+                               (unsigned)PD_Rx_Buf[4], (unsigned)PD_Rx_Buf[5],
+                               (unsigned)(PD_Rx_Buf[2] & 0x1Fu));
                     }
 
-                    /* WCH sample behaviour: echo a canned one-DO answer.  The
-                     * dump above exists to judge whether the charger accepts it
-                     * or expects a full Discover Identity response. */
+                    /* Structured VDM request from the Source: byte2 & 0xC0 == 0
+                     * means Command Type = REQ (SVID 0xFF00 sits in bytes 4/5).
+                     *
+                     * The answer now mirrors the DemoBoard build that is
+                     * field-verified to reach 28 V on this charger: echo the
+                     * received VDM header back as a short 4-byte NAK (Command
+                     * Type 10b) and nothing else.  The crafted 16-byte
+                     * Discover-Identity ACK this case used to send is the prime
+                     * remaining byte-level deviation from the proven partner
+                     * behaviour; the charger does not need a *valid* identity
+                     * (the verified build never supplies one), so the minimal
+                     * trivially-well-formed answer is the safer move. */
                     if((PD_Rx_Buf[2] & 0xC0) == 0)
                     {
+                        UINT8 cmd = (UINT8)(PD_Rx_Buf[2] & 0x1Fu);
+
                         Delay_Ms(1);
                         PD_Load_Header(0x00, DEF_TYPE_VENDOR_DEFINED);
                         if((PD_Rx_Buf[3] & 0x60) == 0) PD_Ctl.Flag.Bit.VDM_Version = 0;
                         else PD_Ctl.Flag.Bit.VDM_Version = 1;
-                        PD_Rx_Buf[2] |= 0x80;
+
+                        /* Exact frame the verified build sends: the request's
+                         * own header bytes with Command Type forced to NAK. */
+                        PD_Rx_Buf[2] |= 0x80u;
+
                         if(PD_VDM_LogCount < 8u)
-                            printf("[PD] VDM reply: %02X %02X %02X %02X\r\n",
-                                   (unsigned)PD_Rx_Buf[2], (unsigned)PD_Rx_Buf[3],
-                                   (unsigned)PD_Rx_Buf[4], (unsigned)PD_Rx_Buf[5]);
+                            printf("[PD] VDM cmd=%u -> 4-byte NAK\r\n", (unsigned)cmd);
+
                         PD_Send_Handle(&PD_Rx_Buf[2], 4, PD_TXJOB_REPLY);
                     }
                     else if(PD_VDM_LogCount < 8u)
                     {
-                        printf("[PD] VDM: no canned reply sent\r\n");
+                        printf("[PD] VDM: no reply sent (command type not a request)\r\n");
                     }
                     break;
 

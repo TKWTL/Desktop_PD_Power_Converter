@@ -25,13 +25,6 @@
 /* Automatic GoodCRC responses get one retry: dropping the ACK makes the Source
  * retire its message and, with its retries spent, Hard Reset the port. */
 #define PD_PORT_ACK_MAX_ATTEMPTS   2u
-/* The PHY does not accept a new BMC_START straight after the previous one: a
- * frame armed right after another transmit (or right after an RX re-arm) never
- * reaches the wire and IF_TX_END never arrives.  The WCH reference never meets
- * this because its policy layer always has a wait between frames; here the gap
- * is enforced explicitly.  Auto-GoodCRC responses are exempt (they run in the
- * RX-completion flow, which leaves the PHY ready to answer immediately). */
-#define PD_PORT_TX_MIN_GAP_US      500u
 
 /* CONFIG and PORT_CC1/2 are 16-bit registers on CH32X035.
  * Do not narrow complemented masks to uint8_t: that would clear CONFIG
@@ -167,18 +160,13 @@ static void pd_port_enter_rx(void)
  *  - PD_TX_EN/BMC_START are cleared first so the PHY sees a clean 0 -> 1 edge.
  *    A frame armed while the previous transmit's state is still latched can be
  *    ignored outright: no bits on the wire, no IF_TX_END;
- *  - the PHY needs a short settle after the previous operation before it will
- *    accept the next one, so the frame is held back until that gap elapsed.
+ *  - no extra wait is inserted: the completion deadlines in PD_Port_Service()
+ *    are the only pacing needed once they are evaluated correctly.
  * The auto-GoodCRC response inside the vector uses the ACK buffer instead: the
  * received message it answers has to stay intact for the policy layer. */
 static void pd_port_start_frame(const uint8_t *buffer, uint8_t length,
                                 uint8_t wch_tx_sel, uint8_t verbose)
 {
-    uint32_t gap = (uint32_t)(TIME_Micros() - s_last_phy_op_us);
-
-    if(gap < PD_PORT_TX_MIN_GAP_US)
-        TIME_DelayUs(PD_PORT_TX_MIN_GAP_US - gap);
-
     USBPD->STATUS |= IF_TX_END;
     USBPD->CONFIG |= IE_TX_END;
     NVIC_EnableIRQ(USBPD_IRQn);
@@ -261,6 +249,24 @@ static uint8_t pd_port_frame_bytes(void)
         count = PD_PORT_MAX_FRAME_BYTES;
 
     return count;
+}
+
+/* Wrap-safe "has this deadline passed?" test.
+ *
+ * The deadline variables hold absolute timestamps (start + timeout).  This file
+ * used to compare the unsigned difference against the timeout instead:
+ *
+ *     if((uint32_t)(now - s_tx_deadline_us) >= PD_PORT_TX_END_TIMEOUT_US)
+ *
+ * With now still before the deadline that difference wraps to ~2^32, making the
+ * comparison true: every frame was declared timed out on the next service pass
+ * while the PHY was still transmitting it (the field dump showed CONTROL = 0x43
+ * / 0xC3 with PD_TX_EN|BMC_START set at "timeout").  Comparing the two
+ * timestamps as signed values is the correct test and survives the 32-bit
+ * microsecond counter wrapping. */
+static inline uint8_t pd_port_time_reached(uint32_t now, uint32_t deadline)
+{
+    return ((int32_t)(now - deadline) >= 0) ? 1u : 0u;
 }
 
 /* One transmit attempt failed (GoodCRC timeout or missing IF_TX_END).  Retry
@@ -498,7 +504,12 @@ void PD_Port_Init(uint8_t *rx_buffer, uint16_t rx_buffer_size)
 
     AFIO->CTLR |= USBPD_IN_HVT | USBPD_PHY_V33;
 
-    USBPD->CONFIG = PD_DMA_EN;
+    /* PD_FILT_ED deliberately NOT set: it was enabled once "for reference
+     * parity" and that was the only round in which the post-Enter
+     * EPR_Get_Source_Cap stopped being acknowledged (GoodCRC timeouts x3,
+     * then ~5 more silent frames).  The build without the filter had that same
+     * EPR_Get acknowledged, so the receive path stays exactly as validated
+     * until a capture proves otherwise. */
     USBPD->STATUS = BUF_ERR | IF_RX_BIT | IF_RX_BYTE |
                     IF_RX_ACT | IF_RX_RESET | IF_TX_END;
 }
@@ -570,19 +581,6 @@ PD_Port_CC PD_Port_DetectAttach(void)
 
     s_last_detect_cc1 = cc1_present;
     s_last_detect_cc2 = cc2_present;
-
-    /* Put the CC pins straight back into their operating configuration.  The
-     * attach probe needs the 0.22 V comparator, but at that threshold the PHY
-     * also decodes its own transmissions as received frames: field logs showed
-     * CC1/CC2 still at CC_CMP_22 while transmitting, our own EPR_Mode frame
-     * coming back as "EPR Mode: unhandled action=1", garbage byte counts
-     * (BMC_BYTE_CNT = 3/7 for a 6-byte frame) and a GoodCRC answered with a
-     * GoodCRC.  The WCH reference restores the port configuration after each
-     * detection pass for exactly this reason.  Skipped while a frame is in
-     * flight so the restore cannot pull CC_LVE out from under a transmit. */
-    if(s_phy_state == PD_PHY_IDLE)
-        PD_Port_SetPowerRole(s_auto_ack_pr_role ? PD_PORT_ROLE_SOURCE
-                                                : PD_PORT_ROLE_SINK);
 
     if((USBPD->PORT_CC1 & CC_PD) == 0)
         return PD_PORT_CC_NONE;
@@ -664,7 +662,7 @@ void PD_Port_Service(void)
 
     if(s_phy_state == PD_PHY_TX)
     {
-        if((uint32_t)(now - s_tx_deadline_us) >= PD_PORT_TX_END_TIMEOUT_US)
+        if(pd_port_time_reached(now, s_tx_deadline_us) != 0u)
         {
             s_tx_end_timeouts++;
 
@@ -708,7 +706,7 @@ void PD_Port_Service(void)
     }
     else if(s_phy_state == PD_PHY_ACK_TX)
     {
-        if((uint32_t)(now - s_tx_deadline_us) >= PD_PORT_TX_END_TIMEOUT_US)
+        if(pd_port_time_reached(now, s_tx_deadline_us) != 0u)
         {
             s_ack_tx_timeouts++;
 
@@ -753,7 +751,7 @@ void PD_Port_Service(void)
     }
     else if(s_phy_state == PD_PHY_WAIT_GOODCRC)
     {
-        if((uint32_t)(now - s_tx_deadline_us) >= PD_PORT_GOODCRC_TIMEOUT_US)
+        if(pd_port_time_reached(now, s_tx_deadline_us) != 0u)
         {
             s_goodcrc_timeouts++;
             pd_port_tx_attempt_failed();

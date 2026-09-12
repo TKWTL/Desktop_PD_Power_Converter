@@ -94,3 +94,20 @@ OLED 的 VPP 由板卡直接提供,因此 SH1107 内部 DC-DC/电荷泵保持关
 
 项目自写代码:**GNU AGPL-3.0-only**。WCH 厂商库的例外/声明边界见 `LICENSE`
 与 `THIRD_PARTY_NOTICES.md`。
+
+## 芯片手册与参考资料
+
+### 芯片数据手册
+
+| 芯片 | 用途 | 资料 |
+|---|---|---|
+| CH32X035C8T6 | 主控 MCU(RISC-V4C,内置 USB + PD PHY) | [沁恒产品页](https://www.wch.cn/products/CH32X035.html) · [数据手册 CH32X035DS0](http://www.wch.cn/downloads/CH32X035DS0_PDF.html) · [参考手册 CH32X035RM](https://www.wch.cn/downloads/CH32X035RM_PDF.html) · [EVT 例程包](https://www.wch.cn/downloads/CH32X035EVT_ZIP.html) |
+| SW3538 | 双口快充输出控制器(PT1/PT2) | [智融科技官网](https://www.ismartware.com/)(数据手册见官网「产品中心」) · [双口快充方案资料(PDF)](https://www.ismartware.com/upload/goods/20220811/202208111603413353.pdf) |
+| SW3526 | 单口快充输出控制器(两颗,软件 I²C) | [SW3526 数据手册(PDF,智融科技)](https://www.ismartware.com/upload/goods/20220721/202207211750013134.pdf) |
+| SH1107 | 0.78" OLED 显示控制器(Sino Wealth) | [SH1107 数据手册 V2.3(PDF)](https://files.waveshare.com/upload/1/16/SH1107V2.3.pdf) |
+| GX21M15U | I²C 温度传感器(中科银河芯) | [产品页](https://www.gxcas.com/en/prodetail.html?id=281) · [数据手册 V2.3(PDF)](https://gxcas.com/uploads/files/202509/GX21M15_%E6%95%B0%E6%8D%AE%E6%89%8B%E5%86%8C_V2.3_20250919110520.pdf) |
+
+### 参考项目
+
+- [0wQ/CH32X035-PD-Tester](https://github.com/0wQ/CH32X035-PD-Tester) — 同款 CH32X035 PHY 的 USB-PD 3.2 Sink 实现(SPR / EPR Fixed / SPR AVS / EPR AVS 与 MIPPS);本工程 EPR 调优时的协议行为与位域对照参考。
+- [TKWTL/CH32X035_DemoBoard](https://github.com/TKWTL/CH32X035_DemoBoard) — 本工程软件架构蓝本(PD 状态机与 CH32X035 端口层的最初版本)。

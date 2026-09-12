@@ -85,6 +85,11 @@ EPR 永远进不去，然后 20 V SPR ↔ 重新协商反复循环。
 修复：`PD_EPR_GET_CAP_DELAY_MS` 120 → **2 ms**（`PD_Send_Handle()` 内部已会等
 auto-GoodCRC 结束，2 ms 只是离开 ACK 窗口）。
 
+**2026-09-12 复现（异步 TX 引擎）**：把该值改回 120 ms 后，现场日志再次出现该故障——
+`Enter Succeeded` 之后连续 9 帧 `EPR_Get_Source_Cap` 全部 `TO=0/3/0 → 0/6/0 → 0/9/0`
+（帧都发出、充电器 0 个 GoodCRC），随后 Source Hard Reset、VBUS 掉到 12 V 级并整端口重谈。
+**不要再提高这个值**；Get 应在 `Enter_Succeeded` 处理器里当场发出，任务侧 2 ms 只是兜底。
+
 ### 6. Hard Reset 真伪判定（2026-09-12）
 
 ISR 原来只看 `IF_RX_RESET` 就认定 Source Hard Reset。为区分「真 HR」与「RX 错误/线缆毛刺
