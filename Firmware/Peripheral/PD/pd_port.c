@@ -218,30 +218,16 @@ static void pd_port_latch_hard_reset(void)
 
 /* Frame length to hand to the policy layer.
  *
- * BMC_BYTE_CNT is not trustworthy here: when a frame lands while the PHY is
- * still closing out a transmit it reads stale values (3 and 7 were observed for
- * a 6-byte GoodCRC), and using it as the capture length truncated extended
- * messages.  The header carries the real length, so the larger of the two
- * wins: 2 header bytes plus the data objects, or the extended header's data
- * size.  The CRC is checked and consumed by hardware and is not part of the
- * captured bytes. */
+ * BMC_BYTE_CNT is not trustworthy during tight TX/RX turnarounds.  The PD
+ * Message Header already gives the exact DMA payload allocation: two header
+ * bytes plus NDO*4 bytes.  Extended messages still use NDO for the physical
+ * frame size; their 16-bit Extended Header/DataSize is parsed later by pd.c. */
 static uint8_t pd_port_frame_bytes(void)
 {
     uint8_t hdr = s_rx_dma_buf[1];
-    uint8_t need;
+    uint8_t need =
+        (uint8_t)(2u + (4u * (uint8_t)((hdr >> 4) & 0x07u)));
     uint8_t count = USBPD->BMC_BYTE_CNT;
-
-    if((hdr & 0x80u) != 0u)
-    {
-        /* Extended: 2-byte header + 4-byte extended header + DataSize. */
-        uint16_t data_size = (uint16_t)(((uint16_t)s_rx_dma_buf[3] >> 1) |
-                                        ((uint16_t)(s_rx_dma_buf[4] & 0x01u) << 7));
-        need = (uint8_t)(2u + 4u + (uint8_t)data_size);
-    }
-    else
-    {
-        need = (uint8_t)(2u + (4u * (uint8_t)((hdr >> 4) & 0x07u)));
-    }
 
     if(count < need)
         count = need;
@@ -599,6 +585,128 @@ void PD_Port_SelectCC(PD_Port_CC cc)
         USBPD->CONFIG |= CC_SEL;
     else
         USBPD->CONFIG &= (uint16_t)~(uint16_t)CC_SEL;
+}
+
+/* Atomic normal-SOP transaction restored from the field-verified DemoBoard
+ * path.  C140 can return GoodCRC and its policy response with very little
+ * spacing; keeping TX_END -> RX turnaround -> GoodCRC in one PHY operation
+ * prevents the following Accept from landing while the foreground TX engine
+ * still owns the receive path. */
+uint8_t PD_Port_TransactSOP(const uint8_t *buffer,
+                            uint8_t length,
+                            uint8_t max_attempts)
+{
+    uint8_t attempt;
+    uint8_t msgid;
+
+    if((buffer == 0) || (length < 2u) ||
+       (length > PD_PORT_MAX_FRAME_BYTES) || (max_attempts == 0u))
+        return 0u;
+
+    /* Never cut through an automatic GoodCRC or another physical TX. */
+    if(s_phy_state != PD_PHY_IDLE)
+        return 0u;
+
+    memcpy(s_tx_dma_buf, buffer, length);
+    msgid = (uint8_t)(s_tx_dma_buf[1] & 0x0Eu);
+    s_tx_result = PD_PORT_TX_RESULT_NONE;
+
+    for(attempt = 0u; attempt < max_attempts; attempt++)
+    {
+        uint8_t cnt = 250u;
+
+        /* PD_ALL_CLR below can erase reset evidence, so latch it first. */
+        if(USBPD->STATUS & IF_RX_RESET)
+        {
+            USBPD->STATUS |= IF_RX_RESET;
+            pd_port_latch_hard_reset();
+            s_phy_state = PD_PHY_IDLE;
+            s_rx_armed = 0u;
+            NVIC_DisableIRQ(USBPD_IRQn);
+            return 0u;
+        }
+
+        /* Exact transaction shape used by the proven DemoBoard:
+         * mask USBPD IRQ -> blocking SOP TX -> immediate RX -> poll GoodCRC. */
+        NVIC_DisableIRQ(USBPD_IRQn);
+        s_phy_state = PD_PHY_TX;
+        s_rx_armed = 0u;
+
+        /* Auto-GoodCRC leaves the transmitter latched; force a clean start
+         * edge before arming the foreground frame. */
+        USBPD->CONTROL &= (uint8_t)~(PD_TX_EN | BMC_START);
+        USBPD->STATUS |= IF_TX_END | IF_RX_ACT;
+
+        pd_port_begin_tx_lowlevel(s_tx_dma_buf, length, UPD_SOP0);
+
+        while((USBPD->STATUS & IF_TX_END) == 0u)
+        {
+            if(USBPD->STATUS & IF_RX_RESET)
+            {
+                USBPD->STATUS |= IF_RX_RESET;
+                pd_port_latch_hard_reset();
+                USBPD->PORT_CC1 &= (uint16_t)~(uint16_t)CC_LVE;
+                USBPD->PORT_CC2 &= (uint16_t)~(uint16_t)CC_LVE;
+                USBPD->CONTROL &= (uint8_t)~PD_TX_EN;
+                s_phy_state = PD_PHY_IDLE;
+                s_rx_armed = 0u;
+                return 0u;
+            }
+        }
+
+        USBPD->STATUS |= IF_TX_END;
+        pd_port_enter_rx();
+        s_phy_state = PD_PHY_WAIT_GOODCRC;
+
+        while(--cnt)
+        {
+            if(USBPD->STATUS & IF_RX_RESET)
+            {
+                USBPD->STATUS |= IF_RX_RESET;
+                pd_port_latch_hard_reset();
+                s_phy_state = PD_PHY_IDLE;
+                s_rx_armed = 0u;
+                return 0u;
+            }
+
+            if((USBPD->STATUS & IF_RX_ACT) != 0u)
+            {
+                uint8_t status = (uint8_t)USBPD->STATUS;
+                uint8_t type = (uint8_t)(s_rx_dma_buf[0] & 0x1Fu);
+                uint8_t goodcrc =
+                    (((status & MASK_PD_STAT) == PD_RX_SOP0) &&
+                     (type == PD_PORT_GOODCRC_TYPE) &&
+                     ((s_rx_dma_buf[1] & 0x70u) == 0u) &&
+                     ((s_rx_dma_buf[1] & 0x0Eu) == msgid)) ? 1u : 0u;
+
+                USBPD->STATUS |= IF_RX_ACT;
+
+                if(goodcrc != 0u)
+                {
+                    /* RX is already running.  Publish IDLE before unmasking so
+                     * an immediately following Accept/PS_RDY is handled as a
+                     * normal Source message and receives automatic GoodCRC. */
+                    s_phy_state = PD_PHY_IDLE;
+                    s_rx_armed = 1u;
+                    USBPD->CONFIG |= IE_RX_ACT | IE_RX_RESET | PD_DMA_EN;
+                    NVIC_EnableIRQ(USBPD_IRQn);
+                    return 1u;
+                }
+            }
+
+            TIME_DelayUs(3u);
+        }
+
+        s_goodcrc_timeouts++;
+        s_phy_state = PD_PHY_IDLE;
+    }
+
+    /* The final attempt ended in RX mode; keep listening for recovery traffic. */
+    s_phy_state = PD_PHY_IDLE;
+    s_rx_armed = 1u;
+    USBPD->CONFIG |= IE_RX_ACT | IE_RX_RESET | PD_DMA_EN;
+    NVIC_EnableIRQ(USBPD_IRQn);
+    return 0u;
 }
 
 uint8_t PD_Port_StartTx(const uint8_t *buffer, uint8_t length,

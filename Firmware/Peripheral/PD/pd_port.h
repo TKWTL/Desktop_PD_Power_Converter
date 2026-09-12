@@ -17,8 +17,9 @@ extern "C" {
  *   - RX: the USBPD dedicated DMA fills an internal buffer; the frame is
  *     copied into the mailbox passed to PD_Port_Init() after its automatic
  *     GoodCRC has physically finished;
- *   - TX: fully asynchronous - PD_Port_StartTx() + USBPD IRQ + GoodCRC/timeout
- *     result, with no busy-wait anywhere in the PHY layer.
+ *   - TX: Source-originated RX/auto-GoodCRC remains IRQ-driven; normal
+ *     Sink-originated SOP traffic uses a short atomic TX -> RX -> GoodCRC
+ *     transaction matching the field-verified DemoBoard/C140 path.
  */
 
 typedef enum
@@ -83,6 +84,13 @@ typedef struct
 } PD_Port_PhyDiag;
 
 void PD_Port_GetPhyDiag(PD_Port_PhyDiag *diag);
+
+/* Field-verified CH32X035/C140 normal-SOP sender transaction.
+ * Only the microsecond-scale TX -> RX turnaround -> GoodCRC window is atomic;
+ * ordinary RX and automatic GoodCRC remain USBPD-IRQ driven. */
+uint8_t PD_Port_TransactSOP(const uint8_t *buffer,
+                            uint8_t length,
+                            uint8_t max_attempts);
 
 /* ---- asynchronous SOP transmit engine ---------------------------------
  * PD_Port_StartTx() hands a frame to the USBPD dedicated DMA and returns at

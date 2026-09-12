@@ -28,17 +28,10 @@
 #define PD_EPR_MODE_EXIT                  5U
 #define PD_EXT_CHUNK_DATA_MAX             26U
 #define PD_EPR_CAP_BUFFER_SIZE            64U
-/* Fallback gap between EPR_Mode Enter_Succeeded and the first
- * EPR_Get_Source_Cap; used only when the immediate send from the
- * Enter_Succeeded handler could not start (PHY busy).
- *
- * Do NOT raise this.  Field logs on this charger (Lenovo C140) show a Get
- * sent 120 ms after Enter Succeeded being ignored outright - nine frame
- * attempts, zero GoodCRC (TO=0/3/0 -> 0/6/0 -> 0/9/0) - followed by a Source
- * Hard Reset and a full port power-flap, while an immediate Get under the
- * same conditions is served.  Keep the gap small: just enough to stay out of
- * our own auto-GoodCRC window. */
-#define PD_EPR_GET_CAP_DELAY_MS           2U
+/* Match the field-verified DemoBoard/C140 sequence.  Do not transmit
+ * EPR_Get_Source_Cap from the Enter_Succeeded handler itself: let the
+ * Source finish the EPR entry transition and send the Get after 120 ms. */
+#define PD_EPR_GET_CAP_DELAY_MS           120U
 /* Some Sources answer EPR_Get_Source_Cap late; the old 500 ms bail-out made us
  * send EPR_Mode(Exit) before the caps had a chance to arrive. */
 #define PD_EPR_SOURCE_CAP_TIMEOUT_MS      1200U
@@ -453,7 +446,7 @@ static void PD_Load_Header( UINT8 ex, UINT8 msg_type )
  */
 static UINT8 PD_Send_Handle( const UINT8 *pbuf, UINT8 len, UINT8 job )
 {
-    UINT8  cnt;
+    UINT8 cnt;
 
     if( ( len % 4 ) != 0 )
     {
@@ -471,19 +464,27 @@ static UINT8 PD_Send_Handle( const UINT8 *pbuf, UINT8 len, UINT8 job )
         PD_Tx_Buf[ 2 + cnt ] = pbuf[ cnt ];
     }
 
-    /* Hand the frame to the USBPD dedicated DMA.  From here on the USBPD IRQ
-     * owns it (IF_TX_END -> RX turnaround -> Source GoodCRC -> result) and the
-     * completion is dispatched by PD_TxCompletion_Proc() with PD_TxJob as the
-     * caller's context.  No busy-wait, no IRQ mask, no scheduler stall.
-     *
-     * The Message ID is deliberately NOT advanced here.  It moves only when the
-     * transaction is over (GoodCRC received, or the retries are exhausted), so
-     * a PHY retry keeps using the frame the Source may already have seen. */
-    PD_TxJob = job;
-    if(!PD_Port_StartTx(PD_Tx_Buf, (UINT8)(len + 2u), 1u))
-    {
-        PD_TxJob = PD_TXJOB_NONE;
+    /* Keep only the sender-response critical section atomic.  This is the
+     * DemoBoard/C140-proven path: SOP TX -> TX_END -> immediate RX -> GoodCRC.
+     * Do not printf/yield/I2C/UI inside PD_Port_TransactSOP(). */
+    PD_TxJob = PD_TXJOB_NONE;
+    if(!PD_Port_TransactSOP(PD_Tx_Buf, (UINT8)(len + 2u), 3u))
         return DEF_PD_TX_FAIL;
+
+    /* A retry keeps the same Message ID; only a GoodCRC completes the
+     * transaction and advances the next outbound Message ID. */
+    PD_Ctl.Msg_ID = (UINT8)((PD_Ctl.Msg_ID + 2u) & 0x0Eu);
+
+    /* These two flags/timers used to be set by the asynchronous completion
+     * dispatcher.  The transaction is already complete when this function
+     * returns, so update them here without adding timing-sensitive prints. */
+    if(job == PD_TXJOB_GET_SRC_CAP)
+    {
+        PD_GetSrcCap_Sent = 1u;
+    }
+    else if(job == PD_TXJOB_EPR_GET_CAP)
+    {
+        PD_EPR_TimerMs = 0u;
     }
 
     return DEF_PD_TX_OK;
@@ -1356,19 +1357,9 @@ static void PD_Handle_EPR_Mode_Message(void)
             PD_EPR_KeepAliveWaitAck = 0;
             PD_EPR_KeepAliveAckMs = 0;
 
-            /* Send the Get from here, in the same policy pass that consumed
-             * Enter_Succeeded: this charger serves a Get that goes out within
-             * a few milliseconds and ignores one that arrives at ~120 ms
-             * (nine unacknowledged frames, then Hard Reset).  The EPR task
-             * keeps the retries: if this call fails to start, or the GoodCRC
-             * never comes, PD_TxCompletion_Proc() clears GetCapSent and the
-             * task re-sends after PD_EPR_GET_CAP_DELAY_MS. */
-            if(PD_Send_Extended_Control(PD_EXT_CTRL_EPR_GET_SOURCE_CAP,
-                                        PD_TXJOB_EPR_GET_CAP) == DEF_PD_TX_OK)
-            {
-                PD_EPR_GetCapSent = 1;
-                PD_EPR_GetCapTries = 1;
-            }
+            /* DemoBoard/C140-proven ordering: do not start a new transmit from
+             * inside the Enter_Succeeded receive pass.  The WAIT_SOURCE_CAP
+             * state sends EPR_Get_Source_Cap after PD_EPR_GET_CAP_DELAY_MS. */
         }
         else
         {
@@ -1414,30 +1405,26 @@ static void PD_Main_Proc( )
     if(PD_Port_HardResetPending())
     {
         PD_Port_PhyDiag hr;
-        PD_Port_GetPhyDiag(&hr);
+        UINT8 was_epr = (PD_EPR_State != EPR_ST_OFF) ? 1u : 0u;
 
+        PD_Port_GetPhyDiag(&hr);
         PD_Port_ClearHardResetEvent();
-        /* ST / CNT / EPRst identify the event in the field log; "session kept"
-         * marks the non-destructive handling below. */
-        printf("[PD] IF_RX_RESET: ST=%u CNT=%u VBUS=%u mV EPRst=%u (session kept)\r\n",
+        PD_Port_ClearMessageEvent();
+
+        /* IF_RX_RESET + PD_RX_SOP1_HRST (ST=2) + CNT=0 is a Hard Reset
+         * ordered set.  VBUS can still be near 20 V at the instant the CC
+         * reset is decoded; the Source removes/restarts VBUS afterwards. */
+        printf("[PD] Source Hard Reset: ST=%u CNT=%u VBUS=%u mV EPRst=%u\r\n",
                (unsigned)hr.hr_pd_stat, (unsigned)hr.hr_byte_count,
                (unsigned)s_pd_vbus_mv, (unsigned)PD_EPR_State);
 
-        /* Do NOT tear the session down any more.  Field evidence (2026-09-12):
-         * this event arrives as ST=2 (SOP1/reset), CNT=0 with VBUS unchanged
-         * at ~19.9 V, at EPR exchange boundaries - and the Source keeps
-         * sending EPR messages right after it (the caps chunks continued after
-         * the first event).  A port Hard Reset would have removed VBUS and
-         * stopped the exchange, so these are cable-domain resets or line
-         * artefacts.  The PHY reset + FailedForAttach this handler used to do
-         * is what destroyed the very handshake it interrupted (the second
-         * event killed the exchange waiting for Accept, and earlier rounds got
-         * the endless SPR -> EPR -> reset power-flap from it).
-         * Keep the protocol state and any pending message; only re-arm the
-         * receiver.  A genuine Hard Reset still reaches recovery through VBUS:
-         * the Source removes power, the VBUS tracking owns the detach path,
-         * and its restart is followed by fresh Source_Capabilities that
-         * renegotiate the contract. */
+        /* If the Source aborted an EPR attempt, do not immediately re-enter
+         * EPR during the same physical attachment.  This prevents the
+         * SPR->EPR->HardReset power-flap loop; a real unplug/replug clears it. */
+        if(was_epr)
+            PD_EPR_FailedForAttach = 1u;
+
+        PD_PHY_Reset();
         PD_Rx_Mode();
         return;
     }
