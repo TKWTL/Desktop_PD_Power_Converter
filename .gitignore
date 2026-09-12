@@ -1,0 +1,29 @@
+# MounRiver Studio / Eclipse local state
+.mrs/
+.template
+.settings/
+*.launch
+
+# Build outputs
+/obj/
+/Firmware/obj/
+/Firmware/Project/obj/*
+!/Firmware/Project/obj/.gitkeep
+build/
+*.o
+*.d
+*.elf
+*.hex
+*.bin
+*.map
+*.lst
+*.siz
+*.su
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.tmp

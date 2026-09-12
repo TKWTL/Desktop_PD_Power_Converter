@@ -1,0 +1,30 @@
+/********************************** (C) COPYRIGHT *******************************
+ * CH32X035 Desktop PD Power Converter application entry.
+ *******************************************************************************/
+
+#include "main.h"
+#include "debug.h"
+#include "usart_async.h"
+#include "pd.h"
+#include "app_tasks.h"
+
+int main(void)
+{
+    NVIC_PriorityGroupConfig(NVIC_PriorityGroup_1);
+    SystemCoreClockUpdate();
+    Delay_Init();
+
+    /* The board is VBUS-powered and presents passive Rd from power-up. Start
+     * the USB-PD PHY before UART/I2C/UI setup so the first Source_Capabilities
+     * burst is not lost while the MCU is still booting. */
+    PD_Init();
+
+    USART1_Async_Init(921600u);
+    APP_Tasks_Init();
+
+    while(1)
+    {
+        APP_Tasks_RunOnce();
+        APP_Tasks_Idle();
+    }
+}

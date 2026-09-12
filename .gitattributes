@@ -1,0 +1,32 @@
+# Line-ending policy for a Windows-only embedded toolchain project.
+# Firmware sources are plain text; let Git store LF internally and give the
+# Windows tools (MounRiver Studio / Eclipse) CRLF on checkout, which is what
+# they write themselves.
+* text=auto
+
+# MounRiver / Eclipse project files are XML: keep CRLF so local edits do not
+# show up as whole-file diffs.
+*.cproject text eol=crlf
+*.project  text eol=crlf
+*.wvproj   text eol=crlf
+*.launch   text eol=crlf
+
+# Never let Git touch binary assets: a schematic PDF or an image must survive
+# a checkout byte for byte.
+*.pdf  binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.bmp  binary
+*.ico  binary
+*.hex  binary
+*.bin  binary
+*.elf  binary
+*.a    binary
+*.lib  binary
+*.zip  binary
+*.xls  binary
+*.xlsx binary
+*.doc  binary
+*.docx binary
