@@ -1,0 +1,336 @@
+diff --git a/Firmware/Peripheral/PD/pd_port.c b/Firmware/Peripheral/PD/pd_port.c
+--- a/Firmware/Peripheral/PD/pd_port.c
++++ b/Firmware/Peripheral/PD/pd_port.c
+@@ -60,6 +60,10 @@
+ static volatile uint8_t  s_message_pending;
+ static volatile uint8_t  s_hard_reset_pending;
+ static volatile uint8_t  s_auto_ack_pr_role;
++/* Keep automatic GoodCRC ownership independent from the experimental async
++ * foreground TX state machine.  This matches the field-verified DemoBoard:
++ * RX packet -> 30 us -> GoodCRC -> TX_END -> publish message. */
++static volatile uint8_t  s_auto_ack_inflight;
+ static volatile uint16_t s_auto_ack_started;
+ static volatile uint16_t s_auto_ack_completed;
+ static volatile uint32_t s_last_auto_ack_completed_us;
+@@ -137,6 +141,9 @@
+     USBPD->CONFIG |= PD_ALL_CLR;
+     USBPD->CONFIG &= (uint16_t)~(uint16_t)PD_ALL_CLR;
+     USBPD->CONTROL &= (uint8_t)~PD_TX_EN;
+-    USBPD->DMA = (uint32_t)(uintptr_t)s_rx_dma_buf;
++    /* DemoBoard golden path: receive directly into the protocol buffer.
++     * GoodCRC TX uses its own buffer, so the received frame remains intact
++     * until TX_END publishes the message event. */
++    USBPD->DMA = (uint32_t)(uintptr_t)s_rx_mailbox;
+     USBPD->BMC_CLK_CNT = UPD_TMR_RX_48M;
+     USBPD->CONTROL |= BMC_START;
+@@ -218,6 +225,6 @@
+ static uint8_t pd_port_frame_bytes(void)
+ {
+-    uint8_t hdr = s_rx_dma_buf[1];
++    uint8_t hdr = s_rx_mailbox[1];
+     uint8_t need =
+         (uint8_t)(2u + (4u * (uint8_t)((hdr >> 4) & 0x07u)));
+     uint8_t count = USBPD->BMC_BYTE_CNT;
+@@ -278,17 +285,16 @@
+     DBG_ISR_BUMP(DBG_ISR_USBPD);
+     status = (uint8_t)USBPD->STATUS;
+ 
+-    /* A received Hard Reset (or cable reset) terminates whatever transaction
+-     * is in flight.  Latch the hardware evidence before any PD_ALL_CLR. */
++    /* DemoBoard golden behaviour: a received reset owns the port immediately.
++     * Preserve the evidence, terminate any ACK/TX ownership and let policy
++     * restart the protocol session. */
+     if(status & IF_RX_RESET)
+     {
+         USBPD->STATUS |= IF_RX_RESET;
+-        /* A frame may have been in flight when the reset arrived: release the
+-         * CC drivers, otherwise a stuck CC_LVE/PD_TX_EN keeps the PHY from
+-         * ever starting the next frame (no IF_TX_END at all). */
+         USBPD->PORT_CC1 &= (uint16_t)~(uint16_t)CC_LVE;
+         USBPD->PORT_CC2 &= (uint16_t)~(uint16_t)CC_LVE;
+         USBPD->CONTROL &= (uint8_t)~PD_TX_EN;
++        s_auto_ack_inflight = 0u;
+         s_phy_state = PD_PHY_IDLE;
+         s_tx_result = PD_PORT_TX_RESULT_NONE;
+         s_message_pending = 0u;
+@@ -304,98 +310,58 @@
+         {
+             uint8_t count = USBPD->BMC_BYTE_CNT;
+             uint8_t type = 0u;
+-            uint8_t is_goodcrc;
++            uint8_t is_goodcrc = 0u;
+ 
+-            /* Ignore the PHY picking up its own transmission.  A loopback copy
+-             * of our frame must never be treated as a fresh message (it was
+-             * processed as "EPR Mode: unhandled action=1" once) and must never
+-             * be answered with a GoodCRC: that ACK collides with the Source's
+-             * real answer.  Compared against the hold copy, so it works even
+-             * though the shared PHY buffer now holds the received bytes.  A
+-             * GoodCRC for our frame starts with 0x41 and is therefore never
+-             * filtered here. */
+-            if(((s_phy_state == PD_PHY_TX) ||
+-                (s_phy_state == PD_PHY_WAIT_GOODCRC)) &&
+-               (s_tx_len >= 2u) &&
+-               (s_rx_dma_buf[0] == s_tx_dma_buf[0]) &&
+-               (s_rx_dma_buf[1] == s_tx_dma_buf[1]))
++            if((s_rx_mailbox != 0) && (count >= 2u))
+             {
+-                return;
++                type = (uint8_t)(s_rx_mailbox[0] & 0x1Fu);
++                is_goodcrc = ((type == PD_PORT_GOODCRC_TYPE) &&
++                              ((s_rx_mailbox[1] & 0x70u) == 0u)) ? 1u : 0u;
+             }
+ 
+-            if(count >= 2u)
+-                type = (uint8_t)(s_rx_dma_buf[0] & 0x1Fu);
+-
+-            /* A GoodCRC is a control message (NDO = 0) carrying type 1, and it
+-             * must be recognised from the header alone: BMC_BYTE_CNT reads an
+-             * unreliable value (3/7 seen) when the frame arrives while the PHY
+-             * is still closing out a transmit.  A wrong byte count used to make
+-             * the GoodCRC look like a normal message, so it was answered with a
+-             * GoodCRC of our own - which collides with the Source's next frame
+-             * and is exactly how the negotiation kept falling apart. */
+-            is_goodcrc = ((type == PD_PORT_GOODCRC_TYPE) &&
+-                          ((s_rx_dma_buf[1] & 0x70u) == 0u)) ? 1u : 0u;
+-
+-            if(s_phy_state == PD_PHY_WAIT_GOODCRC)
++            /* Compatibility for the retained asynchronous foreground engine.
++             * Normal policy traffic uses PD_Port_TransactSOP() with the IRQ
++             * masked, so this branch is normally inactive. */
++            if((s_phy_state == PD_PHY_WAIT_GOODCRC) ||
++               (s_phy_state == PD_PHY_TX))
+             {
+-                /* This must be the Source's GoodCRC echoing our Message ID. */
+                 if((is_goodcrc != 0u) &&
+-                   ((s_rx_dma_buf[1] & 0x0Eu) == s_tx_msgid))
++                   ((s_rx_mailbox[1] & 0x0Eu) == s_tx_msgid))
+                 {
++                    if(s_phy_state == PD_PHY_TX)
++                    {
++                        USBPD->STATUS |= IF_TX_END;
++                        pd_port_enter_rx();
++                    }
+                     s_tx_result = PD_PORT_TX_RESULT_OK;
+                     s_phy_state = PD_PHY_IDLE;
+                 }
+             }
+-            else if(s_phy_state == PD_PHY_TX)
++            else if((s_phy_state == PD_PHY_IDLE) &&
++                    (s_auto_ack_inflight == 0u) &&
++                    (s_rx_mailbox != 0) &&
++                    (count >= PD_PORT_MIN_RX_FRAME_BYTES))
+             {
+-                /* The Source's GoodCRC can overtake the IF_TX_END of our own
+-                 * frame in the same interrupt.  Accepting it here keeps the
+-                 * frame from being retransmitted a moment later (the retry
+-                 * would reach the Source as a duplicate Message ID). */
+-                if((is_goodcrc != 0u) &&
+-                   ((s_rx_dma_buf[1] & 0x0Eu) == s_tx_msgid))
++                /* Exact DemoBoard RX contract: every ordinary SOP message is
++                 * acknowledged in the vector after 30 us.  The DMA already
++                 * wrote the message directly into PD_Rx_Buf; do not move or
++                 * repoint that RX data before the GoodCRC has finished. */
++                if((count != PD_PORT_MIN_RX_FRAME_BYTES) ||
++                   (type != PD_PORT_GOODCRC_TYPE))
+                 {
+-                    USBPD->STATUS |= IF_TX_END;   /* the frame did finish */
+-                    pd_port_enter_rx();
+-                    s_tx_result = PD_PORT_TX_RESULT_OK;
+-                    s_phy_state = PD_PHY_IDLE;
+-                }
+-            }
+-            else if(s_phy_state == PD_PHY_IDLE)
+-            {
+-                /* The hardware only raises IF_RX_ACT for a complete SOP0 frame,
+-                 * so every non-GoodCRC here is a real message to answer.  Do not
+-                 * gate this on BMC_BYTE_CNT: it reads stale values often enough
+-                 * that valid messages were being left unacknowledged. */
+-                if(is_goodcrc == 0u)
+-                {
+-                    /* Full SOP message: answer with GoodCRC right here (hard
+-                     * timing), then hand the bytes to the mailbox once the ACK
+-                     * frame has physically finished. */
+-                    TIME_DelayUs(30);
++                    TIME_DelayUs(30u);
+ 
+-                    s_ack_buf[0] = 0x41;
+-                    s_ack_buf[1] = (uint8_t)((s_rx_dma_buf[1] & 0x0Eu) |
++                    s_ack_buf[0] = 0x41u;
++                    s_ack_buf[1] = (uint8_t)((s_rx_mailbox[1] & 0x0Eu) |
+                                              s_auto_ack_pr_role);
+-                    s_rx_capture_len = pd_port_frame_bytes();
+ 
+                     USBPD->STATUS |= IF_TX_END;
+                     USBPD->CONFIG |= IE_TX_END;
++                    s_auto_ack_inflight = 1u;
+                     s_auto_ack_started++;
+-                    s_ack_attempts_left = PD_PORT_ACK_MAX_ATTEMPTS - 1u;
+-                    s_phy_state = PD_PHY_ACK_TX;
+-                    s_tx_deadline_us = TIME_Micros() + PD_PORT_TX_END_TIMEOUT_US;
+                     pd_port_begin_tx_lowlevel(s_ack_buf, 2u, UPD_SOP0);
+                     return;
+                 }
+-            }
+-            else
+-            {
+-                /* Frame arrived while a frame or an ACK was still on the wire:
+-                 * its bytes land in the DMA buffer, but a capture that the new
+-                 * reception may have partially overwritten must never be
+-                 * published to the policy layer. */
+-                s_rx_capture_len = 0u;
+             }
+         }
+     }
+@@ -406,27 +372,21 @@
+         USBPD->PORT_CC2 &= (uint16_t)~(uint16_t)CC_LVE;
+         USBPD->STATUS |= IF_TX_END;
+ 
+-        if(s_phy_state == PD_PHY_ACK_TX)
++        if(s_auto_ack_inflight != 0u)
+         {
++            /* Publish the Source packet only after its GoodCRC is physically
++             * off the wire.  This is the same ordering used by DemoBoard. */
++            s_auto_ack_inflight = 0u;
+             s_auto_ack_completed++;
+             s_last_auto_ack_completed_us = TIME_Micros();
++            s_message_pending = 1u;
++            s_rx_armed = 0u;  /* DMA currently points at s_ack_buf */
++            NVIC_DisableIRQ(USBPD_IRQn);
++            return;
++        }
+ 
+-            /* Deliver the acknowledged packet to the policy layer, then stop
+-             * servicing the PHY until the main loop consumed it (PD_Rx_Mode()
+-             * re-arms; a second packet in that window would overwrite it). */
+-            if((s_rx_mailbox != 0) && (s_rx_capture_len >= 2u))
+-            {
+-                memcpy(s_rx_mailbox, s_rx_dma_buf, s_rx_capture_len);
+-                s_message_pending = 1u;
+-            }
+-            s_phy_state = PD_PHY_IDLE;
+-            s_rx_armed = 0u;          /* PHY still holds the ACK transmit state */
+-            NVIC_DisableIRQ(USBPD_IRQn);
+-        }
+-        else if(s_phy_state == PD_PHY_TX)
++        if(s_phy_state == PD_PHY_TX)
+         {
+-            /* Frame done: switch back to RX so the GoodCRC can arrive in the
+-             * next few tens of microseconds. */
+             pd_port_enter_rx();
+ 
+             if(s_tx_expect_goodcrc)
+@@ -463,6 +423,7 @@
+     s_message_pending = 0;
+     s_hard_reset_pending = 0;
+     s_auto_ack_pr_role = 0;
++    s_auto_ack_inflight = 0u;
+     s_auto_ack_started = 0;
+     s_auto_ack_completed = 0;
+     s_last_auto_ack_completed_us = 0u;
+@@ -493,8 +454,5 @@
+-    /* PD_FILT_ED deliberately NOT set: it was enabled once "for reference
+-     * parity" and that was the only round in which the post-Enter
+-     * EPR_Get_Source_Cap stopped being acknowledged (GoodCRC timeouts x3,
+-     * then ~5 more silent frames).  The build without the filter had that same
+-     * EPR_Get acknowledged, so the receive path stays exactly as validated
+-     * until a capture proves otherwise. */
++    /* Match DemoBoard's known-good USBPD baseline.  RX interrupts are enabled
++     * by PD_Port_RxStart(); the dedicated DMA itself is enabled here. */
++    USBPD->CONFIG = PD_DMA_EN;
+     USBPD->STATUS = BUF_ERR | IF_RX_BIT | IF_RX_BYTE |
+                     IF_RX_ACT | IF_RX_RESET | IF_TX_END;
+@@ -523,15 +481,10 @@
+ void PD_Port_RxStart(void)
+ {
+-    /* Never reset the PHY while a frame is being transmitted (auto GoodCRC or
+-     * foreground TX): PD_ALL_CLR here would truncate it. */
+-    if(s_phy_state != PD_PHY_IDLE)
++    /* DemoBoard rule: PD_ALL_CLR must never truncate an interrupt-driven
++     * GoodCRC or a foreground frame. */
++    if((s_auto_ack_inflight != 0u) || (s_phy_state != PD_PHY_IDLE))
+         return;
+ 
+-    /* Already listening?  Then this call is a no-op: re-writing BMC_START a few
+-     * tens of microseconds before the policy sends a frame opens a fresh PHY
+-     * settle window and the frame is never transmitted.  The old code called
+-     * this on every idle main-loop pass, which is exactly how the EPR handshake
+-     * and the post-Hard-Reset Get_Source_Cap kept failing. */
+     if(s_rx_armed != 0u)
+         return;
+ 
+@@ -540,7 +493,7 @@
+     USBPD->CONFIG |= IE_RX_ACT | IE_RX_RESET | PD_DMA_EN;
+     USBPD->PORT_CC1 &= (uint16_t)~(uint16_t)CC_LVE;
+     USBPD->PORT_CC2 &= (uint16_t)~(uint16_t)CC_LVE;
+-    USBPD->DMA = (uint32_t)(uintptr_t)s_rx_dma_buf;
++    USBPD->DMA = (uint32_t)(uintptr_t)s_rx_mailbox;
+     USBPD->CONTROL &= (uint8_t)~PD_TX_EN;
+     USBPD->BMC_CLK_CNT = UPD_TMR_RX_48M;
+     USBPD->CONTROL |= BMC_START;
+@@ -607,4 +560,14 @@
+-    /* Never cut through an automatic GoodCRC or another physical TX. */
++    /* DemoBoard waits for an interrupt-driven GoodCRC to finish before
++     * masking USBPD IRQ for a foreground sender transaction. */
++    {
++        uint32_t wait_start = TIME_Micros();
++        while(s_auto_ack_inflight != 0u)
++        {
++            if((uint32_t)(TIME_Micros() - wait_start) >= 1000u)
++                return 0u;
++        }
++    }
++
+     if(s_phy_state != PD_PHY_IDLE)
+         return 0u;
+ 
+@@ -674,7 +637,7 @@
+                 uint8_t status = (uint8_t)USBPD->STATUS;
+-                uint8_t type = (uint8_t)(s_rx_dma_buf[0] & 0x1Fu);
++                uint8_t type = (uint8_t)(s_rx_mailbox[0] & 0x1Fu);
+                 uint8_t goodcrc =
+                     (((status & MASK_PD_STAT) == PD_RX_SOP0) &&
+                      (type == PD_PORT_GOODCRC_TYPE) &&
+-                     ((s_rx_dma_buf[1] & 0x70u) == 0u) &&
+-                     ((s_rx_dma_buf[1] & 0x0Eu) == msgid)) ? 1u : 0u;
++                     ((s_rx_mailbox[1] & 0x70u) == 0u) &&
++                     ((s_rx_mailbox[1] & 0x0Eu) == msgid)) ? 1u : 0u;
+@@ -715,5 +678,5 @@
+ uint8_t PD_Port_StartTx(const uint8_t *buffer, uint8_t length,
+                         uint8_t expect_goodcrc)
+ {
+-    if(s_phy_state != PD_PHY_IDLE)
++    if((s_auto_ack_inflight != 0u) || (s_phy_state != PD_PHY_IDLE))
+         return 0u;
+@@ -748,17 +711,22 @@
+ uint8_t PD_Port_TxBusy(void)
+ {
+-    return (s_phy_state != PD_PHY_IDLE) ? 1u : 0u;
++    return ((s_auto_ack_inflight != 0u) ||
++            (s_phy_state != PD_PHY_IDLE)) ? 1u : 0u;
+ }
+ 
+ void PD_Port_AbortTx(void)
+ {
+-    if((s_phy_state == PD_PHY_TX) || (s_phy_state == PD_PHY_ACK_TX))
++    if((s_phy_state == PD_PHY_TX) || (s_auto_ack_inflight != 0u))
+     {
+         USBPD->STATUS |= IF_TX_END;
+-        pd_port_enter_rx();
++        USBPD->PORT_CC1 &= (uint16_t)~(uint16_t)CC_LVE;
++        USBPD->PORT_CC2 &= (uint16_t)~(uint16_t)CC_LVE;
++        USBPD->CONTROL &= (uint8_t)~PD_TX_EN;
+     }
+ 
++    s_auto_ack_inflight = 0u;
+     s_phy_state = PD_PHY_IDLE;
+     s_tx_result = PD_PORT_TX_RESULT_NONE;
+     s_rx_capture_len = 0u;
++    s_rx_armed = 0u;
+ }
+@@ -870,4 +838,4 @@
+ uint8_t PD_Port_AutoAckBusy(void)
+ {
+-    return (s_phy_state == PD_PHY_ACK_TX) ? 1u : 0u;
++    return s_auto_ack_inflight;
+ }

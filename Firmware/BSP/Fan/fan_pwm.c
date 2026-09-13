@@ -50,10 +50,9 @@ void FAN_PWM_SetLevel(uint16_t level)
 
 void FAN_PWM_SetDuty8(uint8_t duty)
 {
-    /* Map 0..255 onto 0..480 with rounding.  This preserves all 256 caller
-     * levels while the timer itself offers 481 physical compare levels. */
-    uint32_t level = ((uint32_t)duty * FAN_PWM_MAX_LEVEL + 127U) / 255U;
-    FAN_PWM_SetLevel((uint16_t)level);
+    /* The compare range is exactly 0..255 (ARR = 255), so the 8-bit duty maps
+     * one-to-one - no scaling any more. */
+    FAN_PWM_SetLevel((uint16_t)duty);
 }
 
 uint16_t FAN_PWM_GetLevel(void)

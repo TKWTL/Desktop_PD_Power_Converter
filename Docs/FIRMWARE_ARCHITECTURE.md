@@ -18,7 +18,7 @@ BSP
   SW3538      protocol/port/ADC driver, handle based
   SW3526      protocol/port/ADC driver, multi-handle safe
   Display     SH1107 transport, IRQ-driven full-frame flush
-  Fan         PB9 / TIM1_CH1 100 kHz PWM
+  Fan         PB9 / TIM1_CH1 187.5 kHz PWM
   Buttons     K1/K2 debounce + edge/DAS state machine
 
 Peripheral

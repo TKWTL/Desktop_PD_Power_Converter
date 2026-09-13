@@ -8,4 +8,5 @@ extern const unsigned char img_dashboard[];
 extern const unsigned char img_home[];
 extern const unsigned char img_configuration[];
 extern const unsigned char img_user_account[];
+extern const unsigned char img_burn_in[];
 #endif

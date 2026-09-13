@@ -211,8 +211,6 @@ typedef enum
     UI_ACTION_UP,      // 向上
     UI_ACTION_DOWN,    // 向下
     UI_ACTION_ENTER,   // 进入或选择
-    UI_ACTION_PLUS,
-    UI_ACTION_MINUS,
     UI_ACTION_BACK
 } UI_ACTION;
 

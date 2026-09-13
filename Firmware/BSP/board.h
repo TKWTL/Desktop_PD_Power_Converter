@@ -14,6 +14,10 @@ uint8_t Board_Key2Pressed(void);
 /* Enter the CH32X035 factory USB ISP on the next reset. Never returns. */
 void Board_RebootToISP(void) __attribute__((noreturn));
 
+/* Plain PFIC software reset; BOOT_MODE stays untouched, so the board boots
+ * the application from flash again. Never returns. */
+void Board_SoftReset(void) __attribute__((noreturn));
+
 #ifdef __cplusplus
 }
 #endif

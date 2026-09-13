@@ -30,6 +30,20 @@ void Board_RebootToISP(void)
     while(1) { }
 }
 
+void Board_SoftReset(void)
+{
+    /* Unlike Board_RebootToISP() the factory BOOT_MODE is left alone: this is
+     * the same PFIC software-reset request NVIC_SystemReset() uses, so the
+     * core restarts in the application from flash.  Clearing the reset flags
+     * first keeps the boot banner honest - the next [RESET] cause reads "SW"
+     * instead of a stale power-on flag. */
+    __disable_irq();
+    RCC->RSTSCKR |= RCC_RMVF;
+    PFIC->CFGR = NVIC_KEY3 | (1u << 7);
+
+    while(1) { }
+}
+
 void Board_Init(void)
 {
     GPIO_InitTypeDef gpio = {0};

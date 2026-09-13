@@ -7,8 +7,8 @@
  * Layout (128x80 panel, 6x12 font, 21 characters per line):
  *   row 1              board input state: temperature / input voltage /
  *                      power limit / PD input state
- *   rows 2..6          three columns: SW3538 "A+C", SW3526 #1 "C1",
- *                      SW3526 #2 "C2"; from top to bottom:
+ *   rows 2..6          three columns: SW3538 "TypeA+C", SW3526 #1 "TypeC1",
+ *                      SW3526 #2 "TypeC2"; from top to bottom:
  *                      port name / output voltage / current / power / protocol
  *
  *   row baseline      y = 12 + 13 * (row - 1)   (1 px top margin, 1 px gap)
@@ -35,9 +35,9 @@
 #define DASH_COL2_X        (DASH_X_MARGIN + 8u * UI_FONT_WIDTH)
 #define DASH_COL3_X        (DASH_X_MARGIN + 15u * UI_FONT_WIDTH)
 
-#define DASH_NAME_SW3538    "A+C"
-#define DASH_NAME_SW3526_1  "C1"
-#define DASH_NAME_SW3526_2  "C2"
+#define DASH_NAME_SW3538    "TypeA+C"
+#define DASH_NAME_SW3526_1  "TypeC1"
+#define DASH_NAME_SW3526_2  "TypeC2"
 
 #define DASH_OFFLINE_TEXT   "---"
 #define DASH_TEXT_LEN       24u
@@ -279,8 +279,7 @@ void Dashboard_Page(ui_t *ui)
 
     /* Read-only page: navigation actions are swallowed here, so only ENTER/BACK
      * leave for the icon menu. */
-    if((ui->action == UI_ACTION_UP) || (ui->action == UI_ACTION_DOWN) ||
-       (ui->action == UI_ACTION_PLUS) || (ui->action == UI_ACTION_MINUS))
+    if((ui->action == UI_ACTION_UP) || (ui->action == UI_ACTION_DOWN))
         ui->action = UI_ACTION_NONE;
 
     dash_fill_sw3538(&columns[0]);

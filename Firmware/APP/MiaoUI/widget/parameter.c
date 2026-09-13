@@ -49,12 +49,10 @@ void ParameterSetting_Widget(ui_t *ui)
     {
         switch (ui->action)
         {
-        case UI_ACTION_PLUS:
-            Draw_Scrollbar(ui, x + 4, y + 18, w - 12, 6, 3, Step);
-            if(ui->nowItem->element->data->function != NULL && ui->nowItem->element->data->functionType == UI_DATA_FUNCTION_STEP_EXECUTE)ui->nowItem->element->data->function(ui);
-            break;
-        case UI_ACTION_MINUS:
-            Step = -Step;
+        case UI_ACTION_DOWN:
+            /* K1 is the only non-ENTER key on this hardware: it steps the
+             * value up, and Draw_Scrollbar wraps at min/max so the whole
+             * range stays reachable with the one key. */
             Draw_Scrollbar(ui, x + 4, y + 18, w - 12, 6, 3, Step);
             if(ui->nowItem->element->data->function != NULL && ui->nowItem->element->data->functionType == UI_DATA_FUNCTION_STEP_EXECUTE)ui->nowItem->element->data->function(ui);
             break;

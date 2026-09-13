@@ -478,7 +478,30 @@ void Draw_Scrollbar(ui_t *ui, uint16_t x, uint16_t y, uint16_t w, uint16_t h, ui
     color = color ? 0 : 1;
     Disp_SetDrawColor(&color);
     ui->scrollbar.value = UI_Animation(temp_q, ui->scrollbar.value, &ui->animation.scrollbar_ani);
-    Disp_DrawRBox(x, y, (uint16_t)UI_FXI(ui->scrollbar.value), h, r);
+
+    /* 防积分饱和与越界：整数 PID 贴近目标时会推过头一两帧，数据条一旦画得比
+     * 轨道还长，超出轨道右端的那截白尖落在“擦除盒”之外，之后每一帧都擦不掉——
+     * 表现为轨道右端残留一块白条（其左缘是擦除端帽留下的凹三角），数据条拉满时
+     * 又正好与它重合。到位即吸附并清零积分项，绘制宽度再钳在 [0, w] 之内。 */
+    if(((temp_q - ui->scrollbar.value) < (UI_FX_ONE / 2)) &&
+       ((ui->scrollbar.value - temp_q) < (UI_FX_ONE / 2)))
+    {
+        ui->scrollbar.value = temp_q;
+        ui->animation.scrollbar_ani.sum_error = 0;
+    }
+    if(ui->scrollbar.value > UI_FX((int32_t)w))
+        ui->scrollbar.value = UI_FX((int32_t)w);
+    else if(ui->scrollbar.value < 0)
+        ui->scrollbar.value = 0;
+
+    /* u8g2_DrawRBox() 在 w < 2r 时内部 ww = w - 2r 会无符号下溢，把中段当成
+     * 超大宽度画出一条横贯全屏的白条（动画从 0 生长的头几帧、或数值为 0 时
+     * 都会命中）。这条越界白条落在擦除轨道(0..w)之外的两端，之后每帧都擦不
+     * 掉：进弹窗一次就在左右两端各留一块残迹，右侧那块最大，且其左缘正是擦
+     * 除轨道端帽的凹弧（数据条拉满时又和它重合）。宽度不足 2r 时直接不画，
+     * 动画长到 6px（=2r，恰好也是本控件的最小可见长度）再开始绘制。 */
+    if(UI_FXI(ui->scrollbar.value) >= (int32_t)(2u * r))
+        Disp_DrawRBox(x, y, (uint16_t)UI_FXI(ui->scrollbar.value), h, r);
     #if ( UI_USE_FREERTOS == 1 )
     if(data->dataRootMutex != NULL)xSemaphoreGive(*data->dataRootMutex);
     #endif

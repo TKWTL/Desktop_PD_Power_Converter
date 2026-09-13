@@ -12,7 +12,7 @@ BSP/                 板级启动 + 器件驱动
   SW3538/            硬件 I2C 双口快充控制器驱动
   SW3526/            句柄式双实例快充控制器驱动
   VBUS/              PA7 ADC 输入母线电压检测
-  Fan/               PB9 / TIM1_CH1 100 kHz PWM 风扇调速
+  Fan/               PB9 / TIM1_CH1 187.5 kHz PWM 风扇调速
   Buttons/           K1/K2 低有效按键消抖/输入状态机
   Display/           SH1107 传输层 + DMA 完成中断整帧刷屏
 Peripheral/PD/       USB-PD Sink / PD3.1 EPR 策略与 PHY 后端
@@ -75,8 +75,8 @@ u8g2 只是作为刻意精简的 SH1107 图形依赖回归,不再包含旧的 SS
 
 ## 风扇 PWM 与 SH1107 显示
 
-- PB9 使用原生 TIM1_CH1 输出 100 kHz PWM。PSC=0、ARR=479 提供 481 个物理占空比等级;
-  `FAN_PWM_SetDuty8()` 对外暴露 256 级接口。
+- PB9 使用原生 TIM1_CH1 输出 187.5 kHz PWM。PSC=0、ARR=255 使 CCR1 与 8 位占空比
+  一一对应(0..255 共 256 级);`FAN_PWM_SetDuty8()` 即该量程的唯一接口。
 - SH1107 使用 SPI1 重映射 10:PA11 SCK、PA10 MOSI、PA12(硬件 NSS 片选)、PA9 D/C。
   SPI 时钟 12 MHz,SPI TX 使用 DMA1 CH3,整帧分页由 DMA 完成中断推进。
 - 0.78 英寸面板由 TK078F288 80×128 原生 u8g2 后端驱动。`U8G2_R1` 得到产品需要的

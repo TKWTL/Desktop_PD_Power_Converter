@@ -13,7 +13,7 @@
 | `indev/` | 输入适配(按键事件 → UI 事件) |
 | `widget/` | 文本与数值/参数控件 |
 | `fonts/` | 唯一字库 `font_menu_main_h12w6` |
-| `images/` | 仪表盘/设置/关于三个 30×30 XBM 图标 |
+| `images/` | 仪表盘/设置/烧屏/关于四个 30×30 XBM 图标(烧屏图标为本项目自绘,其余来自素材包) |
 | `ui_conf.h` | 分辨率、默认旋转 `U8G2_R1`、字体与布局常量 |
 
 > 产品页面函数不放在本目录,而是放在 `APP/Pages/`(例如 `dashboard.c/.h`)。
@@ -49,6 +49,18 @@
 
 > 温度接口预留在 `dash_read_temperature()`(返回 0 表示不可用),
 > 温度驱动完成后在那一处接入即可。
+
+## 服务项与设置项
+
+菜单树(`ui_conf.c`)直接挂载,没有 "Tools" 二级菜单:
+
+- 主菜单 `-Burn-in Test`(`Pages/service_pages.c` 的 `Burnin_Page()`):
+  先显示说明(约 3 s,任意键跳过),随后整屏涂白用于烧屏观察,任意键返回菜单;
+- 设置页(紧跟在显示类设置项之后,由 `Add_Service_Items()` 注册):
+  - ` Fan Test`:数值弹窗 0..255(PWM 8 位占空比);K1 步进 ±32、两端回环,
+    每步立即写 TIM1_CH1 风扇 PWM(`FAN_PWM_SetDuty8()`),退出后保持当前值;
+  - ` Soft Reset`:`Board_SoftReset()`(PFIC 软件复位,BOOT_MODE 不动);
+  - ` Reboot to ISP`:`Board_RebootToISP()`(下一次复位进入 CH32 出厂 USB ISP)。
 
 ## 输入约定
 

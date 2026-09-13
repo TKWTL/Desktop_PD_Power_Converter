@@ -6,6 +6,7 @@
 #include "images/image.h"
 
 #include "Pages/dashboard.h"
+#include "Pages/service_pages.h"
 
 static ui_page_t s_main_page;
 static ui_page_t s_settings_page;
@@ -14,6 +15,7 @@ static ui_item_t s_dashboard_item;
 static ui_item_t s_settings_item;
 static ui_item_t s_settings_back_item;
 static ui_item_t s_about_item;
+static ui_item_t s_burnin_item;
 
 void Create_Parameter(ui_t *ui)
 {
@@ -49,6 +51,10 @@ void Create_MenuTree(ui_t *ui)
         AddItem("[Home]", UI_ITEM_RETURN, 0,
                 &s_settings_back_item, &s_settings_page, &s_main_page, 0);
         Add_Disp_Items(&s_settings_page);
+        Add_Service_Items(&s_settings_page);
+
+    AddItem("-Burn-in Test", UI_ITEM_WORD, img_burn_in,
+            &s_burnin_item, &s_main_page, 0, Burnin_Page);
 
     AddItem("-About", UI_ITEM_WORD, img_user_account,
             &s_about_item, &s_main_page, 0, 0);
