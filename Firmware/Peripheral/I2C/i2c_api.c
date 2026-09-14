@@ -528,15 +528,12 @@ uint8_t I2C_API_TryWriteRead(I2C_API_Owner owner,
 /* 事件标志清不掉时的熔断：关掉全部 I2C 中断源、拉 STOP、请求总线恢复。
  *
  * WCH/STM32 系 I2C 的事件中断是电平触发：只要 SB/ADDR/BTF/STOPF 里有一个
- * 没被清掉，IT_EVT 一开就会无限重入——实测可达 ~10^6 次/秒（`[DBG] bb isr1s`
- * 里 ev 值可看到）。I2C1_EV 的抢占优先级高于 SysTick，所以一旦风暴，1 ms
- * 节拍、[STUCK] 上报、IWDG 喂狗全部停摆，最后表现为“停在某页 → IWDG 复位”。 */
+ * 没被清掉，IT_EVT 一开就会无限重入——实测可达 ~10^6 次/秒。I2C1_EV 的
+ * 抢占优先级高于 SysTick，所以一旦风暴，1 ms 节拍、IWDG 喂狗全部停摆，
+ * 最后表现为“停在某页 → IWDG 复位”。 */
 static void i2c_abort_event_storm(I2C_API_Error error)
 {
-    uint16_t star1 = I2C1->STAR1;
     uint16_t star2 = I2C1->STAR2;
-
-    DBG_RecordI2cStorm(star1, star2, (uint32_t)s_xfer.state);
 
     I2C_ITConfig(I2C1, (uint16_t)(I2C_IT_EVT | I2C_IT_BUF | I2C_IT_ERR), DISABLE);
     stop_dma();

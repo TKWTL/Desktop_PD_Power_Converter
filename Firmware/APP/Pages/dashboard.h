@@ -15,6 +15,11 @@ extern "C" {
  * port name, output voltage, current, power and negotiated protocol. */
 void Dashboard_Page(ui_t *ui);
 
+/* Row 1 of the dashboard (temperature / input voltage / power limit / PD
+ * state) at its usual coordinates: the main icon menu paints the same line
+ * at the top of the screen (see ui.c, 128x80 layout only). */
+void Dashboard_DrawStatusLine(const ui_t *ui);
+
 #ifdef __cplusplus
 }
 #endif

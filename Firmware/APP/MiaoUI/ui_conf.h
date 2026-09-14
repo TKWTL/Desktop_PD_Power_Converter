@@ -61,6 +61,12 @@ extern "C" {
 #define UI_IMG_HEIGHT  30
 // 图片间距，即两张图片右上角的横坐标差值
 #define UI_IMAGE_SPACE   40
+/* 图标页(主菜单)布局:顶部让出 dashboard 第一行的状态文本空间。
+ * ⚠️ 仅适配 128x80 逻辑画布:图标与页顶进度条整体较默认位置下移 16px,
+ * 状态行本身沿用 dashboard 坐标(见 Dashboard_DrawStatusLine)。
+ * 自上而下:状态文本 y≈2..12 / 进度条 y=16..21 / 图标 y=28..58。 */
+#define UI_IMAGE_Y        28   /* 图标顶边(默认 12 + 16) */
+#define UI_IMAGE_BAR_Y    16   /* 图标页进度条顶边(默认 0 + 16) */
 // 文本页面标题名称显示区域
 #define UI_TITLE_X0     0
 #define UI_TITLE_Y0     0

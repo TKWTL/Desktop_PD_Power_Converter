@@ -32,9 +32,9 @@ DMA1 Channel7  I2C_RX
 ## 事件中断风暴保护(2026-09-12 修复实装)
 
 `I2C1_EV` 是**电平触发**的:只要 `SB`/`ADDR`/`BTF`/`STOPF` 中有一个没被清掉, `IT_EVT`
-一使能就会立刻重入。实测这种风暴可达 **~10^6 次/秒**(`[DBG] bb isr1s: ev=…`),
-而 `I2C1_EV` 的抢占优先级高于 SysTick → 1 ms 节拍、`[STUCK]` 上报、IWDG 喂狗
-全停摆 → 表现成“停在某页 → IWDG 复位”。现在的处理分四层:
+一使能就会立刻重入。实测这种风暴可达 **~10^6 次/秒**,而 `I2C1_EV` 的抢占优先级
+高于 SysTick → 1 ms 节拍、IWDG 喂狗全停摆 → 表现成“停在某页 → IWDG 复位”。
+现在的处理分四层:
 
 0. **开事务前先清场** `i2c_prepare_start()`(每次发 START 前必调):`STAR1→STAR2`
    读序列清掉 `ADDR`/`STOPF`;若还残留 `SB`/`BTF`(这两个只能靠读/写 DR 清,
@@ -47,9 +47,8 @@ DMA1 Channel7  I2C_RX
      （否则每次正常收尾的 TX-DMA 都会把 I2C 复位一次）;
    - 非预期状态的 `SB`/`ADDR` 各有明确处置(读 `STAR2` 清掉 / 熔断恢复)。
 2. **风暴熔断**: ISR 记录“同一状态被连续打断”的次数,超过 `I2C_API_EV_STORM_LIMIT`
-   (64) 就关掉全部 I2C 中断源 + 拉 STOP + `s_recovery_requested=1`,并把现场
-   (`STAR1`/`STAR2`/`state`)存进 `.noinit`,开机由黑匣子打印
-   `[DBG] bb i2c: aborts=… star1=… star2=… state=…`;
+   (64) 就关掉全部 I2C 中断源 + 拉 STOP + `s_recovery_requested=1`,把现场
+   (`STAR1`/`STAR2`/`state`)交给下一轮看门狗恢复;
 3. **看门狗恢复**: 下一轮 10 ms 看门狗执行 `bus_recover()`(外设复位 + GPIO 位翻转
    + 重新初始化)把总线拉回干净状态。
 

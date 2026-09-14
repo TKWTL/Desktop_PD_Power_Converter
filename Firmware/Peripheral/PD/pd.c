@@ -193,10 +193,8 @@ static void PD_PHY_Reset( void )
     PD_SPR_ContractActive = 0;
     PD_EPR_SourcePDO_Count = 0;
     PD_EPR_State = EPR_ST_OFF;
-    /* Do not clear PD_EPR_FailedForAttach on a protocol/PHY reset.  A Source
-     * Hard Reset is not a physical detach; immediately retrying EPR on the
-     * same attachment can create an SPR -> EPR -> reset loop.  A genuine
-     * VBUS detach clears the flag in PD_Det_Proc(). */
+    /* PD_EPR_FailedForAttach survives a PHY reset: only a genuine VBUS detach
+     * (PD_Det_Proc) may re-enable EPR for the next attachment. */
     PD_EPR_GetCapSent = 0;
     PD_EPR_KeepAliveWaitAck = 0;
     PD_EPR_TimerMs = 0;
@@ -280,9 +278,8 @@ static void PD_Det_Proc( void )
 
     if( PD_Ctl.Flag.Bit.Connected )
     {
-        /* WCH's SNK reference notes that detach should be judged from VBUS
-         * for a bus-powered Sink.  APP feeds the INA226 bus-voltage sample
-         * through PD_SetVbusMillivolts(); keep the policy decision here. */
+        /* Bus-powered Sink: detach is judged from VBUS (the APP feeds the
+         * PA7 sense sample through PD_SetVbusMillivolts()). */
         if(s_pd_vbus_valid && s_pd_vbus_mv < PD_VBUS_DETACH_THRESHOLD_MV)
         {
             if(s_pd_vbus_detach_count < 0xFFu)
@@ -410,13 +407,9 @@ static UINT8 PD_Send_Handle( const UINT8 *pbuf, UINT8 len )
 
     is_request = ((PD_Tx_Buf[0] & 0x1Fu) == DEF_TYPE_REQUEST) ? 1u : 0u;
 
-    /* Current Desktop pd_port.c already waits out an interrupt-driven
-     * auto-GoodCRC before entering this transaction.  Keep the sender path
-     * identical for cold boot and software reset:
-     *
-     *   SOP TX -> TX_END -> immediate RX -> matching Source GoodCRC
-     *
-     * No scheduler work / printf / I2C / UI belongs inside that window. */
+    /* Atomic DemoBoard-proven sender path: SOP TX -> TX_END -> RX turnaround
+     * -> matching Source GoodCRC.  No scheduler work / printf / I2C / UI
+     * belongs inside this window. */
     if(PD_Port_TransactSOP(PD_Tx_Buf, (uint8_t)(len + 2u), 3u))
     {
         /* Retries retain the same Message ID; only an acknowledged transaction
@@ -479,10 +472,9 @@ void PDO_Request( UINT8 pdo_index )
     request_ma = Current;
     if(request_ma > PD_SPR_REQUEST_MAX_MA) request_ma = PD_SPR_REQUEST_MAX_MA;
 
-    /* Fixed/Variable RDO: Object Position B31:28, No USB Suspend B24,
-     * EPR Mode Capable B22, operating/max current in 10mA units.
-     * We deliberately leave B23=0 so the Source must use chunked Extended
-     * Messages; PD_Rx_Buf is sized for one 26-byte Extended chunk. */
+    /* Fixed RDO: OPOS B31:28, NoUSB Suspend B24, EPR-capable B22, current in
+     * 10 mA units.  B23 stays 0 so Extended replies must use chunked mode
+     * (PD_Rx_Buf holds one 26-byte chunk). */
     rdo = ((UINT32)(pdo_index & 0x0Fu) << 28) | (1UL << 24);
 #if PD_EPR_ENABLE
     if(PD_Source_EPR_Capable && !PD_EPR_FailedForAttach)
@@ -520,13 +512,10 @@ void PDO_Request( UINT8 pdo_index )
     }
     else if(status != DEF_PD_TX_OK)
     {
-        /* Cold-plug robustness:
-         * A missed GoodCRC on the first Request must not trigger a protocol
-         * reset on this VBUS-powered board.  That reset can make the Source
-         * remove/restart VBUS and brown out the MCU, producing the observed
-         * 5 V reboot loop.  Keep RX armed and let the Source retransmit
-         * Source_Capabilities; the next advertisement naturally retries the
-         * Request with a fresh policy pass. */
+        /* Cold-plug robustness: a missed GoodCRC must not start a protocol
+         * reset on this VBUS-powered board (the Source could drop VBUS and
+         * brown out the MCU).  Stay attached; the next Source_Capabilities
+         * advertisement retries the Request with a fresh policy pass. */
         printf("[PD] SPR Request TX/GoodCRC failed; staying attached and waiting for Source retry\r\n");
         PD_Ctl.PD_State = STA_SRC_CONNECT;
         PD_Rx_Mode();
@@ -566,20 +555,9 @@ static void PD_Save_Adapter_SrcCap( void )
 
     PDO_Len = i;
 
-    /* Modify SrcCap information */
-       /* BIT[31:30] - Fixed Supply */
-       /* BIT29 - Dual-Role Power */
-       /* BIT28 - USB Suspend Power */
-       /* BIT27 - Unconstrained Power */
-       /* BIT26 - USB Communications */
-       /* BIT25 - Dual-Role Data */
-       /* BIT24 - Unchunked Extended Message Supported */
-       /* BIT23 - EPR Mode Capable */
-       /* BIT22 - Reserved,shall be set to zero */
-       /* BIT[21:20] - Peak Current */
-       /* BIT[19:10] - Voltage in 50mV units */
-       /* BIT[9:0] - Maximum Current in 10mA units */
-    /* Keep the received PDO bytes unchanged so printed raw PDO values remain exact. */
+    /* Fixed-PDO bit31:30 supply type, bit23 EPR capable, bit19:10 voltage
+     * (50 mV), bit9:0 current (10 mA).  Raw bytes are kept unchanged for the
+     * terminal dump. */
 
     /* Save the adapter's SrcCap information */
     PD_Rx_Buf[ 1 ] &= 0x8F;
@@ -1239,11 +1217,8 @@ static void PD_Main_Proc( )
         case STA_SRC_CONNECT:
             PD_Ctl.PD_Comm_Timer += Tmr_Ms_Dlt;
 
-            /* A Source normally sends Source_Capabilities after Attach.  If
-             * our PHY joined late (for example after holding RST), explicitly
-             * ask for them.  Previous code only tried once, then called
-             * PD_PHY_Reset() without clearing Connected, which could leave the
-             * state machine permanently stuck in STA_IDLE. */
+            /* A Source normally sends Source_Capabilities after attach; ask
+             * explicitly if it did not (bounded retries, then re-arm). */
             if(PD_Ctl.PD_Comm_Timer >= PD_GET_SOURCE_CAP_RETRY_MS)
             {
                 if(s_pd_get_src_cap_retries < PD_GET_SOURCE_CAP_MAX_RETRIES)
@@ -1366,18 +1341,10 @@ static void PD_Main_Proc( )
                 {
                     UINT32 pdo1;
 
-                    /* A fresh Source_Capabilities while we are waiting for
-                     * EPR Enter ACK/Success means the Source has restarted its
-                     * normal SPR policy sequence.  The Enter frame itself was
-                     * already GoodCRC'd, but GoodCRC is only link-layer ACK; it
-                     * does not mean the Source accepted EPR entry.
-                     *
-                     * Cold-plug C140 does this occasionally: if we ignore the
-                     * new capabilities it waits for a Request while we wait for
-                     * Enter_ACK, and both sides deadlock until our EPR timeout.
-                     * Abort only the in-progress EPR-entry policy and process
-                     * these capabilities normally.  The resulting SPR PS_RDY
-                     * will immediately start a fresh EPR Enter attempt. */
+                    /* Fresh Source_Capabilities during EPR entry = the Source
+                     * restarted its SPR sequence; abort only the in-progress
+                     * EPR entry and process it normally (the next SPR PS_RDY
+                     * starts a fresh Enter attempt). */
                     if((PD_EPR_State == EPR_ST_WAIT_ENTER_ACK) ||
                        (PD_EPR_State == EPR_ST_WAIT_ENTER_SUCCESS))
                     {
@@ -1391,10 +1358,9 @@ static void PD_Main_Proc( )
                     }
                     else if(PD_EPR_State >= EPR_ST_WAIT_SOURCE_CAP)
                     {
-                        /* Once Enter_Succeeded has actually placed both sides
-                         * in EPR mode, an ordinary SPR Source_Capabilities is
-                         * not allowed to overwrite the active EPR policy
-                         * transaction here. */
+                        /* Both sides are already in EPR mode: an ordinary SPR
+                         * Source_Capabilities must not overwrite the active
+                         * EPR policy transaction. */
                         printf("[PD] Source_Capabilities ignored during active EPR state %u\r\n",
                                (unsigned)PD_EPR_State);
                         break;
@@ -1529,13 +1495,10 @@ static void PD_Main_Proc( )
                         printf("[PD] SPR contract ready: PDO%u, %u mV / %u mA\r\n",
                                PD_Selected_PDO, PD_Selected_mV, PD_Selected_mA);
 
-                        /* Enter EPR immediately after the valid SPR PS_RDY.
-                         * The 700 ms hold created a window in which C140
-                         * re-advertised Source_Capabilities with its EPR bit
-                         * cleared; our policy then sent a second SPR Request
-                         * and destroyed the EPR attempt.  The current PHY
-                         * already uses the known-good atomic sender, so keep
-                         * the DemoBoard ordering here. */
+                        /* Enter EPR immediately after the valid SPR PS_RDY
+                         * (DemoBoard ordering): a hold window lets C140
+                         * re-advertise Source_Capabilities without the EPR bit
+                         * and destroy the attempt. */
                         printf("[PD] EPR Mode: sending Enter, Sink PDP=%u W\r\n",
                                (unsigned)PD_EPR_SINK_PDP_W);
                         PD_EPR_State = EPR_ST_WAIT_ENTER_ACK;
@@ -1651,9 +1614,8 @@ static void PD_Main_Proc( )
             }
         }
 
-        /* Re-arm RX only when there is neither a completed packet waiting nor
-         * an automatic GoodCRC still on the wire.  The latter is the narrow
-         * race that produced diagnostics such as started/completed=6/5. */
+        /* Re-arm RX only when no packet is queued and no automatic GoodCRC is
+         * still on the wire. */
         if(!PD_Port_MessagePending() && !PD_Port_AutoAckBusy())
             PD_Rx_Mode();
         PD_Ctl.PD_BusIdle_Timer = 0;
@@ -1716,9 +1678,8 @@ uint8_t PD_IsPowerReady(void)
         return 0u;
 
 #if PD_EPR_ENABLE
-    /* Keep nonessential loads off while an EPR-capable source is moving from
-     * the stable SPR contract into the final EPR contract.  If EPR entry
-     * fails, PD_EPR_FailedForAttach makes the existing SPR contract usable. */
+    /* Report "ready" only for the final contract while an EPR-capable source
+     * moves SPR -> EPR; if entry fails, the SPR contract becomes usable. */
     if(PD_Source_EPR_Capable && !PD_EPR_FailedForAttach)
         return PD_EPR_ContractActive ? 1u : 0u;
 #endif
@@ -1738,9 +1699,8 @@ uint16_t PD_GetContractCurrentMa(void)
 
 uint8_t PD_WantsFastPoll(void)
 {
-    /* PD sender-response timing is much tighter than the normal scheduler idle
-     * cadence.  Stay at full polling speed for the whole physical attachment
-     * and while the PHY/automatic GoodCRC owns the wire. */
+    /* Sender-response timing is tighter than the idle cadence: never sleep
+     * while attached or while the PHY / auto-GoodCRC owns the wire. */
     if(PD_IsConnected() || PD_Port_TxBusy())
         return 1u;
 

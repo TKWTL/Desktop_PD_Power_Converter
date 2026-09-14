@@ -36,19 +36,25 @@
 
 - `Pages/dashboard.c/.h`:`Dashboard_Page()`(开机仪表盘);
 
-- 第 1 行:温度(占位 `--C`,GX21M15U 驱动未接入)、输入电压、功率限制
-  (已协商合同的 V×A,未协商时显示 PDP)、PD 输入状态(`EPR/SPR/NEG/DC/OFF`);
+- 第 1 行:温度(GX21M15U,显示为 `25.3C` 一位小数,传感器离线时 `--.-C`)、
+  输入电压(`20V`,整数伏)、总功率限制(`270Wmax`;数字 3 位右对齐固定 `W` 位置,
+  UVP 0 W、PD 合同 95%、DC 用
+  DOWN 以 10 W 步进调节、60 W 后回绕 270 W)、PD 输入状态(`UVP`/`EPR`/`SPR`/
+  `NEG`/`DC`,输入 <8 V 显示 `UVP`,PD 未连接一律 `DC`;状态文本右对齐到屏幕右缘);
 - 第 2~6 行:3 列 = SW3538(A+C 汇总:共享 VOUT、两口电流之和、芯片协议)、
-  SW3526#1(`C1`)、SW3526#2(`C2`);每列依次为端口名、输出电压、电流、功率、协议;
+  SW3526#1(`C1`)、SW3526#2(`C2`);每列依次为端口名、输出电压、电流、功率、协议
+  (协议行:未接设备 `NC`、接了但无快充 `5V`、否则协议名;文本在列内居中,
+  SW3538 列再右移 3 px);
 - 数值右对齐到列右边界(43/85/127 px);功率 >=10 W 两位小数、<10 W 三位小数
   (普通浮点 printf:MiaoUI 本身已用 `%.2f/%.3f`);
 - 数据取自已刷新的器件镜像,芯片离线时该列显示 `---`;内容签名不变就不重复刷屏,
   但 `Disp_GetFlushCount()` 变化时(菜单/fade/设置页刷过帧)强制重发本页;
-- 只吞掉导航键,按 K2(ENTER) 返回图标菜单。
+- 吞掉导航键(DC 状态下 DOWN 调节总功率限制),按 K2(ENTER) 返回图标菜单。
 - 入页时 `Disp_SetMaxClipWindow()` 恢复全屏剪裁窗口(菜单页会留下标题/数据区剪裁)。
 
-> 温度接口预留在 `dash_read_temperature()`(返回 0 表示不可用),
-> 温度驱动完成后在那一处接入即可。
+> 温度由 `dash_read_temperature()` 取自 `APP_GetGX21M15()` 的 500 ms 镜像
+> (`GX21M15_IsOnline()` + `GX21M15_ReadTemperatureMilliC()`,四舍五入到 0.1 °C),
+> UI 不直接访问 I2C。
 
 ## 服务项与设置项
 
@@ -56,11 +62,22 @@
 
 - 主菜单 `-Burn-in Test`(`Pages/service_pages.c` 的 `Burnin_Page()`):
   先显示说明(约 3 s,任意键跳过),随后整屏涂白用于烧屏观察,任意键返回菜单;
+- 主菜单 `-Dino Game`(`Pages/game_dinosaur.c`,由 NUEDC_2025B Firmware_0 移植):
+  小恐龙跑酷——K1(DOWN) 跳/失败后重开、K2(ENTER) 退出且**保留本次进度**
+  (再次进入继续,不重开);16 ms 帧率(每两次页面调用跑一帧),每帧内跑 2 个 8 ms
+  子步:世界/生成倒计时/起跳下落整体快 2 倍(跳跃轨迹与原版同形、滞空减半),
+  而分数仍按原版速率每帧累加一次;仙人掌/云按原版方式直接以(可能为负的)坐标
+  交给 u8g2 绘制,可正常滚出左边缘;随机数用本工程自研 `rand()/srand()`
+  (以 `TIME_Millis()` 播种);
+- 主菜单 `-Sleep` 图标(低功耗框架,`APP/framework/pm_ui_register.c`):**按下立即关屏**;
+  设置页 `-Sleep`(紧随 `[Home]` 菜单项后)→ `[Sleep]` 页:9 档超时单选
+  (No Auto Sleep…30min,默认 1 min);休眠由 `thread_pm` 推进,详见 `APP/framework/README.md`;
 - 设置页(紧跟在显示类设置项之后,由 `Add_Service_Items()` 注册):
-  - ` Fan Test`:数值弹窗 0..255(PWM 8 位占空比);K1 步进 ±32、两端回环,
-    每步立即写 TIM1_CH1 风扇 PWM(`FAN_PWM_SetDuty8()`),退出后保持当前值;
   - ` Soft Reset`:`Board_SoftReset()`(PFIC 软件复位,BOOT_MODE 不动);
-  - ` Reboot to ISP`:`Board_RebootToISP()`(下一次复位进入 CH32 出厂 USB ISP)。
+  - ` Reboot to ISP`:`Board_RebootToISP()`(下一次复位进入 CH32 出厂 USB ISP);
+  - 临时 `Fan Test` 项已于 2026-09-14 删除:风扇改由 `thread_fan` 按
+    `APP/fan_control.c` 的曲线自动调速,后续 UI 只保留"延后风扇触发点"设置
+    (调用 `FAN_Control_SetTemperatureDelay()`)。
 
 ## 输入约定
 

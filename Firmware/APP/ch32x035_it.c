@@ -47,52 +47,42 @@ static void APP_EmergencyUartWrite(const char *text)
 
 void HardFault_Handler(void)
 {
-    g_dbg_fault_count++;
     APP_EmergencyUartWrite("\r\n[FAULT] HardFault - halted (no software reset)\r\n");
     while(1) { }
 }
 
-/* Every ISR entry bumps a .noinit counter: if a reset happens, the boot log
- * shows how many interrupts arrived in the last second (storm detection). */
 void DMA1_Channel3_IRQHandler(void)
 {
-    DBG_ISR_BUMP(DBG_ISR_SPI_TX);
     SPI_DMA_TxDMA_IRQHandler();
 }
 
 void DMA1_Channel4_IRQHandler(void)
 {
-    DBG_ISR_BUMP(DBG_ISR_UART_TX);
     USART1_Async_TxDMA_IRQHandler();
 }
 
 void DMA1_Channel5_IRQHandler(void)
 {
-    DBG_ISR_BUMP(DBG_ISR_UART_RX);
     USART1_Async_RxDMA_IRQHandler();
 }
 
 void DMA1_Channel6_IRQHandler(void)
 {
-    DBG_ISR_BUMP(DBG_ISR_I2C_TX);
     I2C_API_TxDMA_IRQHandler();
 }
 
 void DMA1_Channel7_IRQHandler(void)
 {
-    DBG_ISR_BUMP(DBG_ISR_I2C_RX);
     I2C_API_RxDMA_IRQHandler();
 }
 
 void I2C1_EV_IRQHandler(void)
 {
-    DBG_ISR_BUMP(DBG_ISR_I2C_EV);
     I2C_API_EV_IRQHandler();
 }
 
 void I2C1_ER_IRQHandler(void)
 {
-    DBG_ISR_BUMP(DBG_ISR_I2C_ER);
     I2C_API_ER_IRQHandler();
 }
 
@@ -102,6 +92,4 @@ void I2C1_ER_IRQHandler(void)
 void SysTick_Handler(void)
 {
     TIME_TickHandler();
-    DBG_TickHook();
-    APP_DbgStallCheck();
 }

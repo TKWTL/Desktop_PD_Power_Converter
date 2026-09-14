@@ -2,12 +2,16 @@
 #include "coroOS.h"
 #include "debug.h"
 #include "pd.h"
+#include "power_limit.h"
+#include "fan_control.h"
+#include "framework/pm_api.h"
 #include "board.h"
 #include "vbus_sense.h"
 #include "i2c_api.h"
 #include "soft_i2c.h"
 #include "sw3526.h"
 #include "sw3538.h"
+#include "GX21M15/gx21m15.h"
 #include "fan_pwm.h"
 #include "spi_dma.h"
 #include "sh1107_display.h"
@@ -17,39 +21,6 @@
 #include "display/dispDriver.h"
 #include "time_api.h"
 
-/* ------------------------------------------------------------------------
- * Freeze diagnostics (checkpoint + stall reporter + watchdog)
- *
- * coroOS is cooperative with no preemption, so one stuck busy-wait freezes the
- * whole product - UI included.  Three aids:
- *
- *  - DBG_CP(n) records the last code region entered (map below);
- *  - APP_DbgStallCheck(), called from the 1 ms SysTick handler, notices that
- *    the main loop stopped advancing and dumps the checkpoint over a polled
- *    UART path BEFORE the IWDG fires - this works even when RAM is not kept;
- *  - the IWDG then resets the MCU instead of leaving the board dead until
- *    someone unplugs it.
- *
- * The checkpoint is also mirrored across the reset in RAM: the startup code
- * clears only .bss, and Link.ld keeps .noinit outside it - and, important,
- * before the _sbrk() heap (newlib allocates the stdio buffer on the first
- * printf and used to overwrite exactly these bytes).
- *
- * Checkpoint map: 1 idle | 11 PD | 12 VBUS | 13 PD done | 14 VBUS done |
- *                 21 UI keys | 22 UI loop | 23 UI done |
- *                 31 soft-I2C #1 | 32 soft-I2C #2 | 33 soft-I2C done |
- *                 41 I2C watchdog | 42 watchdog done | 51 SW3538 | 52 SW3526#1 |
- *                 53 SW3526#2
- * ---------------------------------------------------------------------- */
-#define DBG_CP_MAGIC   0xD06F5A5Au
-#define DBG_STALL_MS   600u
-
-volatile uint32_t g_dbg_checkpoint __attribute__((section(".noinit"), used));
-volatile uint32_t g_dbg_magic      __attribute__((section(".noinit"), used));
-volatile uint32_t g_dbg_loop_beat;
-
-#define DBG_CP(code)    do { g_dbg_checkpoint = (uint32_t)(code); } while(0)
-
 static coro_scheduler_t s_scheduler;
 
 static SoftI2C_Handle s_sw3526_bus1;
@@ -57,8 +28,8 @@ static SoftI2C_Handle s_sw3526_bus2;
 static SW3526_Handle s_sw3526_1;
 static SW3526_Handle s_sw3526_2;
 static SW3538_Handle s_sw3538;
+static GX21M15_Handle s_gx21m15;
 
-/* MiaoUI input adapter intentionally references this product-level handle. */
 ui_t ui;
 
 static void APP_PrintResetCause(void)
@@ -76,78 +47,12 @@ static void APP_PrintResetCause(void)
     RCC_ClearFlag();
 }
 
-/* Polled UART fallback used only when the scheduler has stalled: the normal
- * DMA/ring printf path cannot be trusted and the IWDG reset is imminent. */
-static void APP_DbgEmergencyPutc(char c)
-{
-    uint32_t guard = 200000u;
-
-    while((USART_GetFlagStatus(USART1, USART_FLAG_TXE) == RESET) && guard)
-        guard--;
-
-    if(guard)
-        USART_SendData(USART1, (uint8_t)c);
-}
-
-static void APP_DbgEmergencyWrite(const char *text)
-{
-    while(*text)
-        APP_DbgEmergencyPutc(*text++);
-}
-
-static void APP_DbgEmergencyU32(uint32_t v)
-{
-    char buf[11];
-    uint8_t i = 0u;
-
-    do
-    {
-        buf[i++] = (char)('0' + (v % 10u));
-        v /= 10u;
-    } while((v != 0u) && (i < (uint8_t)(sizeof(buf) - 1u)));
-
-    while(i != 0u)
-        APP_DbgEmergencyPutc(buf[--i]);
-}
-
-void APP_DbgStallCheck(void)
-{
-    static uint32_t beat_last;
-    static uint32_t idle_since_ms;
-    static uint8_t  reported;
-    uint32_t beat = g_dbg_loop_beat;
-    uint32_t now = TIME_Millis();
-
-    if(beat != beat_last)
-    {
-        beat_last = beat;
-        idle_since_ms = now;
-        reported = 0u;
-        return;
-    }
-
-    if((reported != 0u) || ((uint32_t)(now - idle_since_ms) < DBG_STALL_MS))
-        return;
-
-    reported = 1u;
-
-    /* No main-loop progress for DBG_STALL_MS: dump where it stopped, then let
-     * the IWDG finish the recovery. */
-    USART_DMACmd(USART1, USART_DMAReq_Tx, DISABLE);
-    DMA_Cmd(DMA1_Channel4, DISABLE);
-    APP_DbgEmergencyWrite("\r\n[STUCK] cp=");
-    APP_DbgEmergencyU32(g_dbg_checkpoint);
-    APP_DbgEmergencyWrite("\r\n");
-}
-
 THRD_DECLARE(thread_pd)
 {
     THRD_BEGIN;
     while(1)
     {
-        DBG_CP(11);
         PD_Task(TIME_Millis());
-        DBG_CP(13);
         THRD_YIELD;
     }
     THRD_END;
@@ -162,10 +67,8 @@ THRD_DECLARE(thread_vbus)
     while(1)
     {
         THRD_DELAY(20u);
-        DBG_CP(12);
         mv = VBUS_Sense_ReadMillivolts();
         PD_SetVbusMillivolts(mv);
-        DBG_CP(14);
         if(++log_div >= 50u)
         {
             log_div = 0u;
@@ -175,31 +78,126 @@ THRD_DECLARE(thread_vbus)
     THRD_END;
 }
 
+#define UI_FRAME_PERIOD_MS         10u
+#define UI_KEY_SERVICE_MS          10u
+#define PD_STARTUP_QUIET_WINDOW_MS 1000u
+
+static uint32_t s_app_boot_ms;
+
+/* USB-PD GoodCRC reception is a sub-millisecond timing path.  During initial
+ * SPR/EPR negotiation, nonessential display and telemetry traffic can create a
+ * dense SPI/I2C/DMA interrupt load.  Keep the first negotiation window quiet;
+ * after a valid power contract is ready, all normal UI and 500 ms telemetry
+ * work resumes.  If a non-PD/DC source is used, the timeout prevents the UI
+ * from being suppressed indefinitely. */
+static uint8_t APP_NoncriticalIOAllowed(void)
+{
+    if(!PD_IsConnected())
+        return 1u;
+
+    if(PD_IsPowerReady())
+        return 1u;
+
+    if((uint32_t)(TIME_Millis() - s_app_boot_ms) >= PD_STARTUP_QUIET_WINDOW_MS)
+        return 1u;
+
+    return 0u;
+}
+
+/* Key activity for the sleep state: ui_loop() (and with it indevScan()) does
+ * not run while the UI is off, so the wake-up path reads the button events
+ * directly.  Reading them here is safe - the edges are consumed by the normal
+ * indevScan() path only when it runs. */
+static uint8_t app_pm_any_key_activity(void)
+{
+    uint8_t i;
+
+    for(i = 0u; i < (uint8_t)KeyIndex_Max; i++)
+    {
+        if((KEY_GetDASClick((KeyIndex_t)i) != 0u) ||
+           (Key_EdgeDetect((KeyIndex_t)i) != KeyEdge_Null))
+            return 1u;
+    }
+
+    return 0u;
+}
+
+/* Non-consuming key check for the awake path: key states/edges are only read,
+ * so the events stay available to indevScan().  Every press/hold restarts the
+ * idle countdown of the power manager. */
+static uint8_t app_pm_key_active(void)
+{
+    uint8_t i;
+
+    for(i = 0u; i < (uint8_t)KeyIndex_Max; i++)
+    {
+        if((KEY_GetState((KeyIndex_t)i) != KeyState_None) ||
+           (Key_EdgeDetect((KeyIndex_t)i) != KeyEdge_Null))
+            return 1u;
+    }
+
+    return 0u;
+}
 
 THRD_DECLARE(thread_ui)
 {
-    THRD_BEGIN;
+    static uint32_t key_service_ms;
+    static uint32_t now_ms;
 
-    /* The product UI is deliberately independent of the USB-PD state machine:
-     * it must come up on DC input, on a plain 5 V source, or when EPR
-     * negotiation never completes.  The SH1107 init is a short command burst on
-     * the interrupt-driven SPI transport (the TK078F288 sequence carries no
-     * ms delays) and frames are DMA/IRQ driven, so nothing here needs to wait
-     * for PD_IsPowerReady() any more. */
+    THRD_BEGIN;
     diapInit();
     Key_Init();
     MiaoUi_Setup(&ui);
+    key_service_ms = TIME_Millis();
     printf("[OLED] SH1107 ready: logical 128x80, native 80x128, external VPP, charge pump disabled\r\n");
 
     while(1)
     {
-        THRD_DELAY(10u);
-        DBG_CP(21);
-        Key_DebounceService_10ms();
-        Key_Scand();
-        DBG_CP(22);
-        ui_loop(&ui);
-        DBG_CP(23);
+        THRD_DELAY(UI_FRAME_PERIOD_MS);
+        now_ms = TIME_Millis();
+
+        /* Key tick = a true 10 ms grid.  The UI frame is 8 ms, so a plain
+         * "elapsed >= 10 ms" test only fired on every second frame (~16 ms,
+         * drifting with frame load): the 1 s long press became ~1.6 s and the
+         * 80 ms DAS repeat became ~128 ms, so a held DOWN key looked dead.
+         * Advance the deadline by exactly one tick per service (bounded
+         * catch-up; resync if the thread was starved for long). */
+        if((uint32_t)(now_ms - key_service_ms) >= UI_KEY_SERVICE_MS)
+        {
+            uint8_t catch_up = 0u;
+
+            do
+            {
+                key_service_ms += UI_KEY_SERVICE_MS;
+                Key_DebounceService_10ms();
+                ++catch_up;
+            } while(((uint32_t)(now_ms - key_service_ms) >= UI_KEY_SERVICE_MS) && (catch_up < 4u));
+
+            if((uint32_t)(now_ms - key_service_ms) >= UI_KEY_SERVICE_MS)
+                key_service_ms = now_ms;   /* starved: resync the grid */
+
+            Key_Scand();
+        }
+
+        if(pm_api_ui_should_block() || (pm_api_is_unstable_wake() != 0u))
+        {
+            /* UI_OFF: the display hook already blanked the panel and drawing
+             * stays paused.  A key press is only a wake-up request here - the
+             * action is swallowed so it cannot also trigger the menu (this
+             * also covers the ~100 ms silence right after a wake). */
+            if(app_pm_any_key_activity() != 0u)
+                pm_api_refresh_idle();
+            ui.action = UI_ACTION_NONE;
+        }
+        else if(APP_NoncriticalIOAllowed())
+        {
+            /* Any key press/hold also counts as activity for the power manager
+             * (the check is non-consuming, see app_pm_key_active()). */
+            if(app_pm_key_active() != 0u)
+                pm_api_refresh_idle();
+
+            ui_loop(&ui);
+        }
     }
     THRD_END;
 }
@@ -209,11 +207,8 @@ THRD_DECLARE(thread_soft_i2c_service)
     THRD_BEGIN;
     while(1)
     {
-        DBG_CP(31);
         SoftI2C_Service(&s_sw3526_bus1);
-        DBG_CP(32);
         SoftI2C_Service(&s_sw3526_bus2);
-        DBG_CP(33);
         THRD_YIELD;
     }
     THRD_END;
@@ -228,9 +223,7 @@ THRD_DECLARE(thread_i2c_watchdog)
     while(1)
     {
         THRD_DELAY(10u);
-        DBG_CP(41);
         I2C_API_WatchdogService(TIME_Millis());
-        DBG_CP(42);
         if(I2C_API_GetRecoveryCount() != last_recovery_count)
         {
             last_recovery_count = I2C_API_GetRecoveryCount();
@@ -243,55 +236,364 @@ THRD_DECLARE(thread_i2c_watchdog)
     THRD_END;
 }
 
-/* Device mirror polling.
+#define DEVICE_MIRROR_POLL_MS    500u
+#define POLL_PHASE_POWER_MS       50u
+#define POLL_PHASE_GX21M15_MS    300u
+#define POLL_PHASE_FAN_MS        100u
+
+/* ---- Output power allocation ------------------------------------------------
  *
- * Each converter keeps a cached status/telemetry mirror (protocol, port state,
- * VIN/VOUT/IOUT) that the UI reads without touching I2C.  All three mirrors are
- * refreshed on one plain 500 ms cadence; the I2C chain time (write-enable
- * sequence plus 3-4 ADC channels) adds a few ms on top, which is irrelevant for
- * telemetry. */
-#define SW_MIRROR_POLL_MS   500u
+ * The dashboard supplies the total budget (PWR_Limit_GetW(): UVP 0 W, PD 95%
+ * of the contract power, DC user value).  Chips are provisioned in plug-in
+ * order, because only the first attachment can be served with certainty:
+ *   - the first chip with a device attached reserves min(its cap, budget);
+ *   - every other chip (attached later or not yet) gets min(its cap, what is
+ *     left), so a later load still finds the best available ceiling;
+ *   - unplugging releases the reservation automatically - the plan is rebuilt
+ *     from scratch on every 500 ms pass.
+ * Shares are clamped into the range each SetPowerLimitW() accepts
+ * (SW3538 18..140 W, SW3526 12..71 W) and written only when they change. */
+#define PWR_ALLOC_CHIPS       3u
+#define PWR_CAP_SW3538_W    140u
+#define PWR_CAP_SW3526_W     65u
+#define PWR_API_MIN_SW3538_W 18u
+#define PWR_API_MAX_SW3538_W 140u
+#define PWR_API_MIN_SW3526_W 12u
+#define PWR_API_MAX_SW3526_W 71u
 
-/* Keep device mirrors fresh without blocking the cooperative scheduler.  Each
- * handle has its own persistent transfer buffers/sub-coroutine state. */
-THRD_DECLARE(thread_sw3538)
+static uint8_t s_pwr_alloc_order[PWR_ALLOC_CHIPS];   /* 0 = detached, else attach seq */
+static uint8_t s_pwr_alloc_seq;
+static uint8_t s_pwr_alloc_written[PWR_ALLOC_CHIPS];
+static uint8_t s_pwr_alloc_valid[PWR_ALLOC_CHIPS];
+
+static uint8_t app_power_attached(uint8_t chip)
 {
+    if(chip == 0u)
+    {
+        return (uint8_t)((SW3538_IsOnline(&s_sw3538) &&
+                (SW3538_IsPort1DeviceOnline(&s_sw3538) ||
+                 SW3538_IsPort2DeviceOnline(&s_sw3538))) ? 1u : 0u);
+    }
+
+    if(chip == 1u)
+    {
+        return (uint8_t)((SW3526_IsOnline(&s_sw3526_1) &&
+                          SW3526_IsProtocolOnline(&s_sw3526_1)) ? 1u : 0u);
+    }
+
+    return (uint8_t)((SW3526_IsOnline(&s_sw3526_2) &&
+                      SW3526_IsProtocolOnline(&s_sw3526_2)) ? 1u : 0u);
+}
+
+static uint8_t app_power_cap_w(uint8_t chip)
+{
+    return (chip == 0u) ? (uint8_t)PWR_CAP_SW3538_W : (uint8_t)PWR_CAP_SW3526_W;
+}
+
+static uint8_t app_power_api_w(uint8_t chip, uint8_t share)
+{
+    uint8_t w = share;
+
+    if(chip == 0u)
+    {
+        if(w > PWR_API_MAX_SW3538_W) w = PWR_API_MAX_SW3538_W;
+        if(w < PWR_API_MIN_SW3538_W) w = PWR_API_MIN_SW3538_W;
+    }
+    else
+    {
+        if(w > PWR_API_MAX_SW3526_W) w = PWR_API_MAX_SW3526_W;
+        if(w < PWR_API_MIN_SW3526_W) w = PWR_API_MIN_SW3526_W;
+    }
+
+    return w;
+}
+
+static uint8_t app_power_apply_needed(uint8_t chip, uint8_t w)
+{
+    if((s_pwr_alloc_valid[chip] != 0u) && (s_pwr_alloc_written[chip] == w))
+        return 0u;
+
+    return 1u;
+}
+
+static void app_power_apply_done(uint8_t chip, uint8_t w)
+{
+    s_pwr_alloc_written[chip] = w;
+    s_pwr_alloc_valid[chip] = 1u;
+}
+
+/* Refresh the attach order and split the budget; pure computation (no I2C). */
+static void app_power_alloc_plan(uint8_t *share)
+{
+    uint32_t remaining = PWR_Limit_GetW();
+    uint8_t first = 0xFFu;
+    uint8_t i;
+
+    for(i = 0u; i < (uint8_t)PWR_ALLOC_CHIPS; i++)
+    {
+        if(app_power_attached(i) != 0u)
+        {
+            if(s_pwr_alloc_order[i] == 0u)
+                s_pwr_alloc_order[i] = (uint8_t)(++s_pwr_alloc_seq);
+        }
+        else
+        {
+            s_pwr_alloc_order[i] = 0u;      /* unplugged: reservation returns */
+        }
+    }
+
+    for(i = 0u; i < (uint8_t)PWR_ALLOC_CHIPS; i++)
+    {
+        if((s_pwr_alloc_order[i] != 0u) &&
+           ((first == 0xFFu) || (s_pwr_alloc_order[i] < s_pwr_alloc_order[first])))
+            first = i;
+    }
+
+    for(i = 0u; i < (uint8_t)PWR_ALLOC_CHIPS; i++)
+        share[i] = 0u;
+
+    if(first != 0xFFu)
+    {
+        share[first] = (app_power_cap_w(first) < remaining) ?
+                       app_power_cap_w(first) : (uint8_t)remaining;
+        remaining -= share[first];
+    }
+
+    for(i = 0u; i < (uint8_t)PWR_ALLOC_CHIPS; i++)
+    {
+        if(i != first)
+        {
+            share[i] = (app_power_cap_w(i) < remaining) ?
+                       app_power_cap_w(i) : (uint8_t)remaining;
+        }
+    }
+}
+
+/* One merged mirror thread: SW3538 (hardware I2C1) and both SW3526s (soft
+ * I2C) are refreshed back-to-back, then the power budget is re-allocated. */
+THRD_DECLARE(thread_power_mirror)
+{
+    static uint8_t share[PWR_ALLOC_CHIPS];
+    static uint8_t w0;
+    static uint8_t w1;
+    static uint8_t w2;
+    static uint8_t changed;
+
     THRD_BEGIN;
+    THRD_DELAY(POLL_PHASE_POWER_MS);
     while(1)
     {
-        THRD_DELAY(SW_MIRROR_POLL_MS);
-        DBG_CP(51);
-        THRD_SPAWN_ARGS(SW3538_StatusLoad, &s_sw3538);
-        if(SW3538_IsOnline(&s_sw3538))
-            THRD_SPAWN_ARGS(SW3538_ADCLoad, &s_sw3538);
+        if(APP_NoncriticalIOAllowed())
+        {
+            THRD_SPAWN_ARGS(SW3538_StatusLoad, &s_sw3538);
+            if(SW3538_IsOnline(&s_sw3538))
+                THRD_SPAWN_ARGS(SW3538_ADCLoad, &s_sw3538);
+
+            THRD_SPAWN_ARGS(SW3526_StatusLoad, &s_sw3526_1);
+            if(SW3526_IsOnline(&s_sw3526_1))
+                THRD_SPAWN_ARGS(SW3526_ADCLoad, &s_sw3526_1);
+
+            THRD_SPAWN_ARGS(SW3526_StatusLoad, &s_sw3526_2);
+            if(SW3526_IsOnline(&s_sw3526_2))
+                THRD_SPAWN_ARGS(SW3526_ADCLoad, &s_sw3526_2);
+
+            /* Budget -> per-chip power limits (see the rules above). */
+            app_power_alloc_plan(share);
+            w0 = app_power_api_w(0u, share[0]);
+            w1 = app_power_api_w(1u, share[1]);
+            w2 = app_power_api_w(2u, share[2]);
+            changed = 0u;
+
+            if((app_power_apply_needed(0u, w0) != 0u) && (SW3538_IsOnline(&s_sw3538) != 0u))
+            {
+                THRD_SPAWN_ARGS(SW3538_SetPowerLimitW, &s_sw3538, w0);
+                app_power_apply_done(0u, w0);
+                changed = 1u;
+            }
+
+            if((app_power_apply_needed(1u, w1) != 0u) && (SW3526_IsOnline(&s_sw3526_1) != 0u))
+            {
+                THRD_SPAWN_ARGS(SW3526_SetPowerLimitW, &s_sw3526_1, w1);
+                app_power_apply_done(1u, w1);
+                changed = 1u;
+            }
+
+            if((app_power_apply_needed(2u, w2) != 0u) && (SW3526_IsOnline(&s_sw3526_2) != 0u))
+            {
+                THRD_SPAWN_ARGS(SW3526_SetPowerLimitW, &s_sw3526_2, w2);
+                app_power_apply_done(2u, w2);
+                changed = 1u;
+            }
+
+            if(changed != 0u)
+            {
+                printf("[PWR] budget %lu W -> 3538 %u W / C1 %u W / C2 %u W\r\n",
+                       (unsigned long)PWR_Limit_GetW(),
+                       (unsigned)w0, (unsigned)w1, (unsigned)w2);
+            }
+        }
+        THRD_DELAY(DEVICE_MIRROR_POLL_MS);
     }
     THRD_END;
 }
 
-THRD_DECLARE(thread_sw3526_1)
+THRD_DECLARE(thread_gx21m15)
 {
     THRD_BEGIN;
+    THRD_DELAY(POLL_PHASE_GX21M15_MS);
     while(1)
     {
-        THRD_DELAY(SW_MIRROR_POLL_MS);
-        DBG_CP(52);
-        THRD_SPAWN_ARGS(SW3526_StatusLoad, &s_sw3526_1);
-        if(SW3526_IsOnline(&s_sw3526_1))
-            THRD_SPAWN_ARGS(SW3526_ADCLoad, &s_sw3526_1);
+        if(APP_NoncriticalIOAllowed())
+            THRD_SPAWN_ARGS(GX21M15_TemperatureLoad, &s_gx21m15);
+        THRD_DELAY(DEVICE_MIRROR_POLL_MS);
     }
     THRD_END;
 }
 
-THRD_DECLARE(thread_sw3526_2)
+/* Automatic fan speed.  Pure RAM work (it only reads the 500 ms GX21M15
+ * mirror), so unlike the device mirrors it also runs during the PD quiet
+ * window - thermal protection must not wait for a PD contract.  Two guards
+ * keep the fail-safe full-speed blast away from startup and bus glitches: a
+ * missing sensor counts only after FAN_SENSOR_STRIKES consecutive failed
+ * samples, and never during the first FAN_SENSOR_GRACE_MS (the first
+ * temperature sample needs the 300 ms I2C phase plus up to the 1 s quiet
+ * window, so every power-up would otherwise jump straight to 255). */
+#define FAN_POLL_MS          500u
+#define FAN_SENSOR_STRIKES   3u
+#define FAN_SENSOR_GRACE_MS 3000u
+
+THRD_DECLARE(thread_fan)
 {
+    static int32_t temp_mc;
+    static int16_t temp_c;
+    static uint8_t online;
+    static uint8_t sensor_ok;
+    static uint8_t missing;
+    static uint8_t uvp;
+    static uint8_t pwm;
+    static uint8_t applied;
+    static uint8_t applied_valid;
+
     THRD_BEGIN;
+    THRD_DELAY(POLL_PHASE_FAN_MS);
     while(1)
     {
-        THRD_DELAY(SW_MIRROR_POLL_MS);
-        DBG_CP(53);
-        THRD_SPAWN_ARGS(SW3526_StatusLoad, &s_sw3526_2);
-        if(SW3526_IsOnline(&s_sw3526_2))
-            THRD_SPAWN_ARGS(SW3526_ADCLoad, &s_sw3526_2);
+        uvp = (uint8_t)((VBUS_Sense_ReadMillivolts() < PWR_LIMIT_UVP_MV) ? 1u : 0u);
+        online = GX21M15_IsOnline(&s_gx21m15);
+        temp_mc = GX21M15_ReadTemperatureMilliC(&s_gx21m15);
+        temp_c = (int16_t)((temp_mc >= 0) ? ((temp_mc + 500) / 1000)
+                                          : ((temp_mc - 500) / 1000));
+
+        if(online != 0u)
+        {
+            missing = 0u;
+        }
+        else if(missing < 255u)
+        {
+            missing++;
+        }
+
+        sensor_ok = 1u;
+        if((missing >= (uint8_t)FAN_SENSOR_STRIKES) &&
+           ((uint32_t)(TIME_Millis() - s_app_boot_ms) >= FAN_SENSOR_GRACE_MS))
+        {
+            sensor_ok = 0u;      /* truly missing -> the policy returns 255 */
+        }
+
+        pwm = FAN_Control_NextPwm(temp_c, sensor_ok, uvp);
+
+        if((applied_valid == 0u) || (pwm != applied))
+        {
+            applied = pwm;
+            applied_valid = 1u;
+            FAN_PWM_SetDuty8(pwm);
+            printf("[FAN] %dC online=%u uvp=%u -> pwm %u\r\n",
+                   (int)temp_c, (unsigned)online, (unsigned)uvp, (unsigned)pwm);
+        }
+
+        THRD_DELAY(FAN_POLL_MS);
+    }
+    THRD_END;
+}
+
+/* ---- Power management (UI_OFF level) ---------------------------------------
+ *
+ * Activity sources that reset the idle timer (see APP/framework/pm_api.h):
+ *   - any key press (thread_ui);
+ *   - PD/VBUS or output-port plug/unplug edges;
+ *   - more than PM_ACTIVITY_POWER_MW (5 W) leaving the outputs.
+ * thread_pm only drives the framework state machine; the visible effect
+ * (screen off/on) is the OLED hook in APP/framework/pm_device_builtin.c. */
+#define PM_POLL_MS            50u
+#define POLL_PHASE_PM_MS     200u
+#define PM_ACTIVITY_POWER_MW 5000u
+
+/* Total output power from the 500 ms mirrors (same integer math as the
+ * dashboard: SW3538 column = shared VOUT x both port currents). */
+static uint32_t app_output_power_mw(void)
+{
+    const struct SW3526_StatusTypedef *st;
+    uint32_t mw = 0u;
+
+    mw += ((uint32_t)SW3538_ReadVOUTmV(&s_sw3538) *
+           ((SW3538_ReadPort1IOUTmA_x10(&s_sw3538) +
+             SW3538_ReadPort2IOUTmA_x10(&s_sw3538)) / 10u)) / 1000u;
+
+    st = SW3526_GetStatus(&s_sw3526_1);
+    if(st != 0)
+        mw += ((uint32_t)st->vout_mv * (st->iout_ma_x10 / 10u)) / 1000u;
+
+    st = SW3526_GetStatus(&s_sw3526_2);
+    if(st != 0)
+        mw += ((uint32_t)st->vout_mv * (st->iout_ma_x10 / 10u)) / 1000u;
+
+    return mw;
+}
+
+/* Attach state of the input and of every output port: any edge wakes the UI. */
+static uint8_t app_power_activity_signature(void)
+{
+    uint8_t sig = 0u;
+
+    if(PD_IsConnected())
+        sig |= 0x01u;
+    if(VBUS_Sense_ReadMillivolts() >= PWR_LIMIT_UVP_MV)
+        sig |= 0x02u;
+    if(SW3538_IsPort1DeviceOnline(&s_sw3538))
+        sig |= 0x04u;
+    if(SW3538_IsPort2DeviceOnline(&s_sw3538))
+        sig |= 0x08u;
+    if(SW3526_IsProtocolOnline(&s_sw3526_1))
+        sig |= 0x10u;
+    if(SW3526_IsProtocolOnline(&s_sw3526_2))
+        sig |= 0x20u;
+
+    return sig;
+}
+
+THRD_DECLARE(thread_pm)
+{
+    static uint8_t sig;
+    static uint8_t sig_valid;
+    static uint8_t now_sig;
+
+    THRD_BEGIN;
+    THRD_DELAY(POLL_PHASE_PM_MS);
+    while(1)
+    {
+        now_sig = app_power_activity_signature();
+        if((sig_valid == 0u) || (now_sig != sig))
+        {
+            sig = now_sig;
+            sig_valid = 1u;
+            pm_api_refresh_idle();
+        }
+
+        if(app_output_power_mw() > PM_ACTIVITY_POWER_MW)
+            pm_api_refresh_idle();
+
+        pm_api_poll();
+        THRD_DELAY(PM_POLL_MS);
     }
     THRD_END;
 }
@@ -303,9 +605,10 @@ static const coro_thread_fn_t s_threads[] =
     thread_ui,
     thread_soft_i2c_service,
     thread_i2c_watchdog,
-    thread_sw3538,
-    thread_sw3526_1,
-    thread_sw3526_2
+    thread_power_mirror,
+    thread_gx21m15,
+    thread_fan,
+    thread_pm
 };
 static coro_pt_t s_thread_states[sizeof(s_threads) / sizeof(s_threads[0])];
 
@@ -313,18 +616,6 @@ void APP_Tasks_Init(void)
 {
     printf("\r\n=== Desktop PD Power Converter / CH32X035C8T6 ===\r\n");
     APP_PrintResetCause();
-    if(g_dbg_magic == DBG_CP_MAGIC)
-        printf("[DBG] checkpoint retained=%lu\r\n",
-               (unsigned long)g_dbg_checkpoint);
-    else
-        printf("[DBG] checkpoint not retained (magic=%08lX)\r\n",
-               (unsigned long)g_dbg_magic);
-    g_dbg_magic = DBG_CP_MAGIC;
-    g_dbg_checkpoint = 0u;
-
-    /* 上一次复位前的黑匣子快照（中断风暴/停机判定，见 debug.h） */
-    DBG_BlackboxReport();
-    DBG_BlackboxReset();
     printf("SystemClk:%lu Hz ChipID:%08lx\r\n",
            (unsigned long)SystemCoreClock, (unsigned long)DBGMCU_GetCHIPID());
     printf("UART1: PB10 TX / PB11 RX @ 921600, DMA async\r\n");
@@ -340,7 +631,8 @@ void APP_Tasks_Init(void)
 
     I2C_API_Init(I2C_API_DEFAULT_CLOCK_HZ);
     SW3538_HandleInit(&s_sw3538, I2C_API_OWNER_SW3538);
-    printf("I2C1: PA13 SCL / PA14 SDA @ %lu Hz, EV/ER + TX/RX DMA IRQ; SW3538 handle ready\r\n",
+    GX21M15_HandleInit(&s_gx21m15, I2C_API_OWNER_GX21M15U, GX21M15_I2C_ADDR_DEFAULT);
+    printf("I2C1: PA13 SCL / PA14 SDA @ %lu Hz, EV/ER + TX/RX DMA IRQ; SW3538 + GX21M15 ready\r\n",
            (unsigned long)I2C_API_GetClockHz());
 
     s_sw3526_bus1.scl_port = SW3526_1_SCL_GPIO_Port;
@@ -368,12 +660,12 @@ void APP_Tasks_Init(void)
            (unsigned)PD_EPR_TARGET_MV,
            (unsigned)PD_EPR_REQUEST_MAX_MA);
 
+    s_app_boot_ms = TIME_Millis();
+    pm_api_init();
+
     CoroOS_Init(&s_scheduler, s_threads, s_thread_states,
                 (uint8_t)(sizeof(s_threads) / sizeof(s_threads[0])));
 
-    /* Last line of defence against a stuck cooperative thread: reset instead
-     * of freezing until someone unplugs the board.  The next boot prints the
-     * reset cause (IWDG) and the checkpoint captured in .noinit. */
     IWDG_WriteAccessCmd(IWDG_WriteAccess_Enable);
     IWDG_SetPrescaler(IWDG_Prescaler_32);
     IWDG_SetReload(4000u);
@@ -388,26 +680,8 @@ void APP_Tasks_RunOnce(void)
 
 void APP_Tasks_Idle(void)
 {
-    /* Every main-loop pass reaches this hook, so a healthy scheduler keeps the
-     * IWDG fed (see the checkpoint block at the top of this file). */
     IWDG_ReloadCounter();
-    g_dbg_loop_beat++;
-    DBG_CP(1);
 
-    /* coroOS is a flat round-robin scheduler with no idle thread, so this hook
-     * is the idle point of the application.  Raw interrupt paths (SPI/DMA,
-     * I2C EV/ER + DMA, USART DMA, 1 ms SysTick tick) wake the core straight out
-     * of WFI, but two software state machines are advanced *only* from the main
-     * loop and must not be slowed to one pass per millisecond:
-     *
-     *  - software I2C: SoftI2C_Service() moves one edge per pass with a 5 us
-     *    edge spacing, so a 1 ms sleep would stretch a byte by two orders of
-     *    magnitude;
-     *  - USB-PD: the Sink policy state machine produces the sender-response
-     *    latency (measured 5 ms with a fast loop) and a Source gives up once it
-     *    grows past its ~24 ms window.
-     *
-     * Both keep the core spinning, everything else lets it sleep. */
     if(SoftI2C_IsBusy(&s_sw3526_bus1) || SoftI2C_IsBusy(&s_sw3526_bus2))
         return;
 
@@ -430,4 +704,9 @@ SW3526_Handle *APP_GetSW3526_1(void)
 SW3526_Handle *APP_GetSW3526_2(void)
 {
     return &s_sw3526_2;
+}
+
+GX21M15_Handle *APP_GetGX21M15(void)
+{
+    return &s_gx21m15;
 }

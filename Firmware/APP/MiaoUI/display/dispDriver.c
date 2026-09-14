@@ -7,7 +7,18 @@
 #include "sh1107_display.h"
 
 u8g2_t u8g2;
-int Contrast = 32;
+/* UI level 0..15.  Raw SH1107 contrast = x^2 + 2x, so level 15 maps to 255. */
+int Contrast = 5;
+
+static uint8_t disp_contrast_raw(int level)
+{
+    if(level < 0)
+        level = 0;
+    else if(level > 15)
+        level = 15;
+
+    return (uint8_t)(level * level + 2 * level);
+}
 
 static ui_item_t s_contrast_item;
 static ui_item_t s_background_item;
@@ -28,9 +39,9 @@ void Create_Disp_Parameters(ui_t *ui)
     contrast_data.functionType = UI_DATA_FUNCTION_STEP_EXECUTE;
     contrast_data.dataType = UI_DATA_INT;
     contrast_data.actionType = UI_DATA_ACTION_RW;
-    contrast_data.max = 248;
+    contrast_data.max = 15;
     contrast_data.min = 0;
-    contrast_data.step = 8;
+    contrast_data.step = 1;
     contrast_data.decimals = 0;
     contrast_element.data = &contrast_data;
     Create_element(&s_contrast_item, &contrast_element);
@@ -42,7 +53,7 @@ void Create_Disp_Parameters(ui_t *ui)
     background_element.data = &background_data;
     Create_element(&s_background_item, &background_element);
 
-    rotation_data.name = "Landscape Flip";
+    rotation_data.name = "Screen Flip";
     rotation_data.ptr = &ui->rotation;
     rotation_data.function = Disp_ResumeRotation;
     rotation_data.dataType = UI_DATA_SWITCH;
@@ -53,23 +64,19 @@ void Create_Disp_Parameters(ui_t *ui)
 
 void Add_Disp_Items(ui_page_t *parent_page)
 {
-    AddItem(" Background", UI_ITEM_DATA, 0, &s_background_item, parent_page, 0, 0);
     AddItem(" Contrast", UI_ITEM_DATA, 0, &s_contrast_item, parent_page, 0, 0);
-    AddItem(" Landscape Flip", UI_ITEM_DATA, 0, &s_rotation_item, parent_page, 0, 0);
+    AddItem(" Background", UI_ITEM_DATA, 0, &s_background_item, parent_page, 0, 0);
+    AddItem(" Screen Flip", UI_ITEM_DATA, 0, &s_rotation_item, parent_page, 0, 0);
 }
 
 void diapInit(void)
 {
     SH1107_Display_Init(&u8g2);
     u8g2_SetFont(&u8g2, UI_FONT);
-    SH1107_Display_RequestContrast((uint8_t)Contrast);
+    SH1107_Display_RequestContrast(disp_contrast_raw(Contrast));
     u8g2_ClearBuffer(&u8g2);
 }
 
-/* Monotonic count of frames handed to the display transport.  Pages that cache
- * their own pixels use Disp_GetFlushCount() to notice that another page (menu,
- * fade animation, settings) flushed in between, so the panel no longer shows
- * their content and a frame must be pushed again. */
 static uint32_t s_flush_count = 0u;
 
 void Disp_SendBuffer(void)
@@ -85,9 +92,6 @@ uint32_t Disp_GetFlushCount(void)
 
 void Disp_UpdateDisplayArea(uint8_t tx, uint8_t ty, uint8_t tw, uint8_t th)
 {
-    /* Runtime transport is deliberately full-frame and asynchronous. MiaoUI's
-     * first-light pages are small enough that coalescing a 1280-byte frame is
-     * simpler and safer for PD timing than synchronous partial updates. */
     (void)tx;
     (void)ty;
     (void)tw;
@@ -98,13 +102,15 @@ void Disp_UpdateDisplayArea(uint8_t tx, uint8_t ty, uint8_t tw, uint8_t th)
 void Disp_SetContrast(ui_t *ui)
 {
     (void)ui;
-    SH1107_Display_RequestContrast((uint8_t)Contrast);
+    SH1107_Display_RequestContrast(disp_contrast_raw(Contrast));
 }
 
 void Disp_SetContrast2(uint8_t contrast)
 {
+    if(contrast > 15u)
+        contrast = 15u;
     Contrast = (int)contrast;
-    SH1107_Display_RequestContrast(contrast);
+    SH1107_Display_RequestContrast(disp_contrast_raw(Contrast));
 }
 
 void Disp_SetPowerSave(uint8_t is_enable)

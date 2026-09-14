@@ -148,8 +148,9 @@ SECTIONS
 		PROVIDE( _ebss = .);
 	} >RAM AT>FLASH
 
-	/* Not zeroed or loaded by the startup code: keeps the freeze checkpoint
-	   across resets (IWDG).  NOLOAD keeps it out of the flash image. */
+	/* Not zeroed or loaded by the startup code (NOLOAD keeps it out of the
+	   flash image).  Currently unused; reserved for data that must survive
+	   a soft reset. */
 	.noinit (NOLOAD) :
 	{
 		. = ALIGN(8);
@@ -159,8 +160,8 @@ SECTIONS
 	} >RAM
 
 	/* _sbrk() (Project/Debug/debug.c) starts the newlib heap at _end: keep the
-	   heap AFTER .noinit, otherwise the first malloc() - newlib allocates the
-	   stdio buffer on the first printf() - overwrites the checkpoint bytes. */
+	   heap AFTER .noinit, otherwise the first malloc() (newlib allocates the
+	   stdio buffer on the first printf()) would overwrite .noinit data. */
 	PROVIDE( _end = . );
 	PROVIDE( end = . );
 

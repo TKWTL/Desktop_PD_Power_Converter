@@ -40,6 +40,26 @@ static uint16_t decode_adc12(const uint8_t *bytes)
     return (uint16_t)(((uint16_t)bytes[0] << 4) | ((uint16_t)bytes[1] & 0x0Fu));
 }
 
+static uint8_t encode_power_w(uint8_t watts, uint8_t *code)
+{
+    if(code == 0)
+        return 0u;
+
+    if(watts >= 12u && watts <= 63u)
+    {
+        *code = watts;
+        return 1u;
+    }
+
+    if(watts >= 64u && watts <= 71u)
+    {
+        *code = (uint8_t)(watts - 64u);
+        return 1u;
+    }
+
+    return 0u;
+}
+
 void SW3526_HandleInit(SW3526_Handle *handle, SoftI2C_Handle *i2c)
 {
     if(handle == 0)
@@ -160,6 +180,8 @@ SW3526_RET SW3526_PortStatusLoad(SW3526_NOARG)
     SW3526_FUNC_BEGIN;
     SW3526_SPAWN_IO(SW3526_ByteRead(&handle->io_pt, handle, SW3526_STRG_SYS_STAT, &handle->status.sys_stat));
     SW3526_SPAWN_IO(SW3526_ByteRead(&handle->io_pt, handle, SW3526_STRG_FAULT, &handle->status.fault));
+    SW3526_SPAWN_IO(SW3526_ByteRead(&handle->io_pt, handle, SW3526_STRG_POWER, &handle->status.power_state));
+    handle->status.power_state &= 0x7Fu;
     SW3526_FUNC_END;
 }
 
@@ -167,13 +189,41 @@ SW3526_RET SW3526_StatusLoad(SW3526_NOARG)
 {
     SW3526_FUNC_BEGIN;
 
-    /* Keep the composite routine flat: nested composite coroutines would need
-     * a second child continuation.  Leaf I/O calls safely reuse io_pt. */
     SW3526_SPAWN_IO(SW3526_ByteRead(&handle->io_pt, handle, SW3526_STRG_REV, &handle->status.version));
     SW3526_SPAWN_IO(SW3526_ByteRead(&handle->io_pt, handle, SW3526_STRG_PROTOCOL, &handle->status.protocol));
     SW3526_SPAWN_IO(SW3526_ByteRead(&handle->io_pt, handle, SW3526_STRG_SYS_STAT, &handle->status.sys_stat));
     SW3526_SPAWN_IO(SW3526_ByteRead(&handle->io_pt, handle, SW3526_STRG_FAULT, &handle->status.fault));
+    SW3526_SPAWN_IO(SW3526_ByteRead(&handle->io_pt, handle, SW3526_STRG_POWER, &handle->status.power_state));
+    handle->status.power_state &= 0x7Fu;
 
+    SW3526_FUNC_END;
+}
+
+SW3526_RET SW3526_SetPowerLimitW(SW3526_ARGS(uint8_t watts))
+{
+    /* static: value crosses the sub-coroutine yields below (an automatic local
+     * is lost when the function resumes at its saved case label). */
+    static uint8_t code;
+
+    SW3526_FUNC_BEGIN;
+
+    if(handle == 0 || !encode_power_w(watts, &code))
+    {
+        if(handle != 0)
+            handle->last_io = SW3526_IO_ERROR;
+        SW3526_RETURN_END();
+    }
+
+    SW3526_SPAWN_IO(SW3526_ByteWrite(&handle->io_pt, handle, SW3526_CTRG_WREN, SW3526_WREN_STEP1));
+    SW3526_SPAWN_IO(SW3526_ByteWrite(&handle->io_pt, handle, SW3526_CTRG_WREN, SW3526_WREN_STEP2));
+    SW3526_SPAWN_IO(SW3526_ByteWrite(&handle->io_pt, handle, SW3526_CTRG_WREN, SW3526_WREN_STEP3));
+
+    SW3526_SPAWN_IO(SW3526_ByteRead(&handle->io_pt, handle, SW3526_CTRG_FC_CONFIG3, &handle->rxbuf[0]));
+    handle->rxbuf[0] |= SW3526_CTRG_FC_CONFIG3_REG_PWR;
+    SW3526_SPAWN_IO(SW3526_ByteWrite(&handle->io_pt, handle, SW3526_CTRG_FC_CONFIG3, handle->rxbuf[0]));
+    SW3526_SPAWN_IO(SW3526_ByteWrite(&handle->io_pt, handle, SW3526_CTRG_POWER_CONFIG, code));
+
+    handle->status.configured_power_w = watts;
     SW3526_FUNC_END;
 }
 
@@ -185,6 +235,26 @@ const struct SW3526_StatusTypedef *SW3526_GetStatus(const SW3526_Handle *handle)
 uint8_t SW3526_IsOnline(const SW3526_Handle *handle)
 {
     return (handle != 0) ? handle->status.online : 0u;
+}
+
+uint8_t SW3526_GetPortStatus(const SW3526_Handle *handle,
+                             SW3526_PortStatus *status)
+{
+    if(handle == 0 || status == 0)
+        return 0u;
+
+    status->online = handle->status.online;
+    status->protocol_online =
+        (handle->status.protocol & SW3526_STRG_PROTOCOL_ONLINE) ? 1u : 0u;
+    status->high_voltage =
+        (handle->status.protocol & SW3526_STRG_PROTOCOL_HIGH_VOLTAGE) ? 1u : 0u;
+    status->port_on =
+        (handle->status.sys_stat & SW3526_STRG_SYS_STAT_PORT_ON) ? 1u : 0u;
+    status->buck_on =
+        (handle->status.sys_stat & SW3526_STRG_SYS_STAT_BUCK_ON) ? 1u : 0u;
+    status->fault = handle->status.fault;
+    status->power_w = handle->status.power_state;
+    return handle->status.online;
 }
 
 uint8_t SW3526_IsProtocolOnline(const SW3526_Handle *handle)

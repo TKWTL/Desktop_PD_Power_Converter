@@ -21,8 +21,11 @@ static uint8_t KEY_Enter_GetIO(void)
 
 static const KeyInfo_t s_key_info[KeyIndex_Max] =
 {
-    /* LongPress, DAS interval, multi-click timeout, ZeroIsPress, getter */
-    {100U, 16U, 50U, 0U, KEY_Down_GetIO},
+    /* LongPress, DAS interval, multi-click timeout, ZeroIsPress, getter.
+     * K1 (DOWN) auto-repeats faster than K2: it drives menu scrolling and
+     * the numeric dialogs, where 12 ticks (120 ms) per step keeps a held key
+     * controllable; ENTER stays at 16 ticks (160 ms). */
+    {100U, 12U, 50U, 0U, KEY_Down_GetIO},
     {100U, 16U, 50U, 0U, KEY_Enter_GetIO}
 };
 

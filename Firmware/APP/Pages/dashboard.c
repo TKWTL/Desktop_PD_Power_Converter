@@ -5,11 +5,18 @@
  * formats cached telemetry.
  *
  * Layout (128x80 panel, 6x12 font, 21 characters per line):
- *   row 1              board input state: temperature / input voltage /
- *                      power limit / PD input state
+ *   row 1              board input state: temperature ("25.3C") / input voltage
+ *                      ("20V") / total power limit ("270Wmax"; the number is
+ *                      right-aligned in three digits so its "W" sits where the
+ *                      old "140Wmax" had it; DOWN cycles it in the DC path) /
+ *                      PD state ("UVP" below 8 V, right-aligned)
  *   rows 2..6          three columns: SW3538 "TypeA+C", SW3526 #1 "TypeC1",
  *                      SW3526 #2 "TypeC2"; from top to bottom:
  *                      port name / output voltage / current / power / protocol
+ *                      ("NC" = no sink attached, "5V" = sink without a fast
+ *                      charge; protocol text is centered in its column, the
+ *                      SW3538 one shifted 3 px right, and row 1 keeps
+ *                      the PD state right-aligned to the panel edge)
  *
  *   row baseline      y = 12 + 13 * (row - 1)   (1 px top margin, 1 px gap)
  *   column right edge 43 px (7 chars) / 85 px (6 chars) / 127 px (6 chars)
@@ -21,6 +28,7 @@
 #include "app_tasks.h"
 #include "display/dispDriver.h"
 #include "pd.h"
+#include "power_limit.h"
 #include "vbus_sense.h"
 
 #include <stdio.h>
@@ -40,6 +48,8 @@
 #define DASH_NAME_SW3526_2  "TypeC2"
 
 #define DASH_OFFLINE_TEXT   "---"
+#define DASH_PORT_NC_TEXT   "NC"   /* chip online, no sink attached */
+#define DASH_PORT_5V_TEXT   "5V"   /* sink attached, no fast-charge protocol */
 #define DASH_TEXT_LEN       24u
 #define DASH_VALUE_LEN      12u
 #define DASH_SIGNATURE_LEN  160u
@@ -64,7 +74,24 @@ static void dash_draw_right(uint16_t right_x, uint16_t y, const char *text)
     Disp_DrawStr((uint16_t)x, y, text);
 }
 
-static void dash_draw_column(const dash_column_t *col, uint16_t name_x, uint16_t right_x)
+/* The protocol line is centered between the port name (left-aligned) and the
+ * right-aligned value rows; dx is a pixel nudge (the SW3538 status reads 3 px
+ * right of centre). */
+static void dash_draw_center(uint16_t left_x, uint16_t right_x, uint16_t y,
+                             const char *text, int16_t dx)
+{
+    int16_t width = (int16_t)(right_x - left_x + 1u);
+    int16_t text_w = (int16_t)(strlen(text) * UI_FONT_WIDTH);
+    int16_t x = (int16_t)left_x + (width - text_w) / 2 + dx;
+
+    if(x < 0)
+        x = 0;
+
+    Disp_DrawStr((uint16_t)x, y, text);
+}
+
+static void dash_draw_column(const dash_column_t *col, uint16_t name_x,
+                             uint16_t right_x, int16_t protocol_dx)
 {
     uint16_t y = (uint16_t)(DASH_ROW1_Y + DASH_ROW_STEP);   /* row 2: port name */
 
@@ -72,7 +99,8 @@ static void dash_draw_column(const dash_column_t *col, uint16_t name_x, uint16_t
     dash_draw_right(right_x, (uint16_t)(y + DASH_ROW_STEP), col->volt);
     dash_draw_right(right_x, (uint16_t)(y + 2u * DASH_ROW_STEP), col->amp);
     dash_draw_right(right_x, (uint16_t)(y + 3u * DASH_ROW_STEP), col->watt);
-    dash_draw_right(right_x, (uint16_t)(y + 4u * DASH_ROW_STEP), col->protocol);
+    dash_draw_center(name_x, right_x, (uint16_t)(y + 4u * DASH_ROW_STEP),
+                     col->protocol, protocol_dx);
 }
 
 /* Value formatting.  Everything is integer/fixed-point on this MCU: the
@@ -173,7 +201,11 @@ static void dash_fill_sw3538(dash_column_t *col)
         dash_fmt_amp(col->amp, iout_ma_x10);
         dash_fmt_watt(col->watt, mw);
 
-        if(SW3538_IsPort1DeviceOnline(handle) || SW3538_IsPort2DeviceOnline(handle))
+        if(!SW3538_IsPort1DeviceOnline(handle) && !SW3538_IsPort2DeviceOnline(handle))
+            col->protocol = DASH_PORT_NC_TEXT;
+        else if(SW3538_GetProtocol(handle) == SW3538_PROTOCOL_NONE)
+            col->protocol = DASH_PORT_5V_TEXT;
+        else
             col->protocol = dash_protocol_sw3538((uint8_t)SW3538_GetProtocol(handle));
     }
     else
@@ -198,8 +230,15 @@ static void dash_fill_sw3526(dash_column_t *col, SW3526_Handle *handle, const ch
         dash_fmt_amp(col->amp, iout_ma_x10);
         dash_fmt_watt(col->watt, mw);
 
-        if(SW3526_IsProtocolOnline(handle))
-            col->protocol = dash_protocol_sw3526((uint8_t)status->protocol);
+        /* The protocol register carries the type in the low nibble; the raw
+         * byte must be masked (SW3526_GetProtocol) or the online/high-voltage
+         * bits make every lookup fall through to "---". */
+        if(!SW3526_IsProtocolOnline(handle))
+            col->protocol = DASH_PORT_NC_TEXT;
+        else if(SW3526_GetProtocol(handle) == SW3526_PROTOCOL_NONE)
+            col->protocol = DASH_PORT_5V_TEXT;
+        else
+            col->protocol = dash_protocol_sw3526((uint8_t)SW3526_GetProtocol(handle));
     }
     else
     {
@@ -207,17 +246,31 @@ static void dash_fill_sw3526(dash_column_t *col, SW3526_Handle *handle, const ch
     }
 }
 
-/* Placeholder hook for the board temperature: the GX21M15U sensor has no driver
- * yet, so the dashboard renders "--C".  This is the single place where the real
- * reading will be plugged in. */
+/* Board temperature from the 500 ms GX21M15U device mirror (BSP/GX21M15,
+ * polled by thread_gx21m15 in APP/app_tasks.c).  The UI never touches I2C: it
+ * only reads the cached milli-Celsius value and rounds it to 0.1 C.  Returning
+ * 0 lets the caller fall back to the "--.-C" placeholder, exactly like an
+ * offline chip column renders "---". */
 static uint8_t dash_read_temperature(int16_t *tenths_c)
 {
-    (void)tenths_c;
-    return 0u;
+    GX21M15_Handle *handle = APP_GetGX21M15();
+    int32_t milli_c;
+
+    if((tenths_c == 0) || !GX21M15_IsOnline(handle))
+        return 0u;
+
+    milli_c = GX21M15_ReadTemperatureMilliC(handle);
+    *tenths_c = (int16_t)((milli_c >= 0) ? ((milli_c + 50) / 100)
+                                         : ((milli_c - 50) / 100));
+    return 1u;
 }
 
 static const char *dash_pd_state_text(void)
 {
+    /* Input undervoltage overrides every other state (budget forced to 0 W). */
+    if(VBUS_Sense_ReadMillivolts() < PWR_LIMIT_UVP_MV)
+        return "UVP";
+
     if(PD_IsConnected())
     {
         if(!PD_IsPowerReady())
@@ -226,24 +279,8 @@ static const char *dash_pd_state_text(void)
         return PD_IsEPRContractActive() ? "EPR" : "SPR";
     }
 
-    /* VBUS without a PD contract means the DC input path supplies the board. */
-    return (VBUS_Sense_ReadMillivolts() > 5000u) ? "DC" : "OFF";
-}
-
-static uint32_t dash_input_limit_watts(void)
-{
-    uint32_t mv;
-    uint32_t ma;
-
-    if(!PD_IsConnected())
-        return 0u;
-
-    mv = PD_GetContractVoltageMv();
-    ma = PD_GetContractCurrentMa();
-    if((mv != 0u) && (ma != 0u))
-        return (mv * ma) / 1000000u;   /* 32-bit 足够：50 V * 5 A = 250e6 */
-
-    return PD_IsPowerReady() ? (uint32_t)PD_EPR_SINK_PDP_W : 0u;
+    /* No PD contract: the board input is the DC path. */
+    return "DC";
 }
 
 static void dash_signature_append(char *signature, size_t size, const char *text)
@@ -259,6 +296,67 @@ static void dash_signature_append(char *signature, size_t size, const char *text
     strcat(signature, text);
 }
 
+/* Compose the row-1 head (temperature / input voltage / total power limit).
+ * Shared by the full dashboard and by the status line the main icon menu
+ * paints at the top of the screen. */
+static void dash_fmt_row1_head(char *head, size_t size)
+{
+    char temperature[8];
+    char input_volts[8];
+    char input_limit[8];
+    uint32_t input_v;
+    uint32_t limit_w;
+    int16_t tenths_c;
+
+    if(dash_read_temperature(&tenths_c))
+    {
+        const char *sign = "";
+
+        if(tenths_c < 0)
+        {
+            sign = "-";
+            tenths_c = (int16_t)-tenths_c;
+        }
+
+        snprintf(temperature, sizeof temperature, "%s%d.%dC", sign,
+                 (int)(tenths_c / 10), (int)(tenths_c % 10));
+    }
+    else
+    {
+        snprintf(temperature, sizeof temperature, "%s", "--.-C");
+    }
+
+    input_v = ((uint32_t)VBUS_Sense_ReadMillivolts() + 500u) / 1000u;
+    snprintf(input_volts, sizeof input_volts, "%luV", (unsigned long)input_v);
+
+    /* Total output power limit: UVP -> 0 W, PD -> 95% of the contract power,
+     * DC -> user value (the DOWN key cycles it while in the DC path).  The
+     * merged mirror thread consumes this value for the per-chip allocation.
+     * The number is right-aligned in three digits ("  0Wmax" / " 60Wmax" /
+     * "270Wmax") so the "W" stays where the old "140Wmax" had it. */
+    limit_w = PWR_Limit_GetW();
+    snprintf(input_limit, sizeof input_limit, "%3luWmax", (unsigned long)limit_w);
+
+    snprintf(head, size, "%s %s %s", temperature, input_volts, input_limit);
+}
+
+/* Row 1 with its coordinates unchanged; the main icon menu calls this from
+ * ui.c so the menu shows the same live status line (128x80 layout only). */
+void Dashboard_DrawStatusLine(const ui_t *ui)
+{
+    char head[DASH_TEXT_LEN];
+    uint8_t color;
+
+    dash_fmt_row1_head(head, sizeof head);
+
+    color = (uint8_t)(ui->bgColor ^ 1u);
+    Disp_SetFont(UI_FONT);
+    Disp_SetMaxClipWindow();
+    Disp_SetDrawColor(&color);
+    Disp_DrawStr(DASH_X_MARGIN, DASH_ROW1_Y, head);
+    dash_draw_right(DASH_COL3_RIGHT, DASH_ROW1_Y, dash_pd_state_text());
+}
+
 void Dashboard_Page(ui_t *ui)
 {
     static char s_signature[DASH_SIGNATURE_LEN];
@@ -268,41 +366,28 @@ void Dashboard_Page(ui_t *ui)
     dash_column_t columns[DASH_COLUMN_COUNT];
     char signature[DASH_SIGNATURE_LEN];
     char row1[DASH_TEXT_LEN];
-    char temperature[8];
-    char input_volts[8];
-    char input_limit[8];
-    uint32_t tenths;
-    uint32_t limit_w;
-    int16_t tenths_c;
+    char row1_head[DASH_TEXT_LEN];
+    const char *pd_state;
     uint8_t color;
     uint8_t i;
 
-    /* Read-only page: navigation actions are swallowed here, so only ENTER/BACK
-     * leave for the icon menu. */
+    /* Navigation is swallowed here (only ENTER/BACK leave for the icon menu);
+     * in the DC path DOWN also cycles the total power limit. */
     if((ui->action == UI_ACTION_UP) || (ui->action == UI_ACTION_DOWN))
+    {
+        if((ui->action == UI_ACTION_DOWN) && (PWR_Limit_IsAdjustable() != 0u))
+            PWR_Limit_StepDown();
+
         ui->action = UI_ACTION_NONE;
+    }
 
     dash_fill_sw3538(&columns[0]);
     dash_fill_sw3526(&columns[1], APP_GetSW3526_1(), DASH_NAME_SW3526_1);
     dash_fill_sw3526(&columns[2], APP_GetSW3526_2(), DASH_NAME_SW3526_2);
 
-    if(dash_read_temperature(&tenths_c))
-        snprintf(temperature, sizeof temperature, "%dC", (int)(tenths_c / 10));
-    else
-        snprintf(temperature, sizeof temperature, "--C");
-
-    tenths = ((uint32_t)VBUS_Sense_ReadMillivolts() + 50u) / 100u;
-    snprintf(input_volts, sizeof input_volts, "%lu.%luV",
-             (unsigned long)(tenths / 10u), (unsigned long)(tenths % 10u));
-
-    limit_w = dash_input_limit_watts();
-    if(limit_w != 0u)
-        snprintf(input_limit, sizeof input_limit, "%luW", (unsigned long)limit_w);
-    else
-        snprintf(input_limit, sizeof input_limit, "%s", "--W");
-
-    snprintf(row1, sizeof row1, "%s %s %s %s",
-             temperature, input_volts, input_limit, dash_pd_state_text());
+    pd_state = dash_pd_state_text();
+    dash_fmt_row1_head(row1_head, sizeof row1_head);
+    snprintf(row1, sizeof row1, "%s %s", row1_head, pd_state);
 
     /* Content signature: identical strings mean identical pixels, so the frame
      * is pushed to the panel only when something really changed. */
@@ -327,10 +412,14 @@ void Dashboard_Page(ui_t *ui)
 
     color = (uint8_t)(ui->bgColor ^ 1u);
     Disp_SetDrawColor(&color);
-    Disp_DrawStr(DASH_X_MARGIN, DASH_ROW1_Y, row1);
-    dash_draw_column(&columns[0], DASH_X_MARGIN, DASH_COL1_RIGHT);
-    dash_draw_column(&columns[1], DASH_COL2_X, DASH_COL2_RIGHT);
-    dash_draw_column(&columns[2], DASH_COL3_X, DASH_COL3_RIGHT);
+    /* Row 1: fields flow from the left, PD input state is pinned right - the
+     * main icon menu shows the exact same line, so it lives in the shared
+     * helper (same coordinates there as here). */
+    Dashboard_DrawStatusLine(ui);
+    /* SW3538 status reads 3 px right of the column centre. */
+    dash_draw_column(&columns[0], DASH_X_MARGIN, DASH_COL1_RIGHT, 3);
+    dash_draw_column(&columns[1], DASH_COL2_X, DASH_COL2_RIGHT, 0);
+    dash_draw_column(&columns[2], DASH_COL3_X, DASH_COL3_RIGHT, 0);
 
     /* Another page owns the same u8g2 buffer and every fade step flushes its own
      * frame, so the transport count is the reliable "is the panel still mine?"

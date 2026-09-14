@@ -64,14 +64,14 @@
 					"disable_builtin": false,
 					"single_precision_constants": false,
 					"position_independent_code": false,
-					"link_time_optimizer": true,
+					"link_time_optimizer": false,
 					"disable_loop_invariant_move": false,
 					"optimize_unused_sections_declared_as_high_code": false,
 					"code_generation_without_hardware_floating": false,
 					"use_pipelines": false,
 					"show_caret_indicating_the_column": false,
 					"calling_convention_variant": false,
-					"other_optimization_flags": ""
+					"other_optimization_flags": "-flto=auto"
 				},
 				"warnings": {
 					"check_syntax_only": false,
@@ -345,7 +345,7 @@
 		"address": "0x08000000",
 		"target_path": "Project/obj/Desktop_PD_Power_Converter.hex",
 		"clkSpeed": "High",
-		"debug_interface_mode": "1-wire serial",
+		"debug_interface_mode": "",
 		"erase": true,
 		"program": true,
 		"verify": true,

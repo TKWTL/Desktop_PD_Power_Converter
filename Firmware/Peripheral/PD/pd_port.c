@@ -1,12 +1,11 @@
 /********************************** (C) COPYRIGHT *******************************
- * USB-PD hardware port for CH32X035.
+ * USB-PD hardware port for CH32X035 (Sink).
  *
- * Desktop_PD_Power_Converter:
- * - normal Sink-originated SOP traffic uses the short atomic DemoBoard-proven
- *   TX -> TX_END -> immediate RX -> Source GoodCRC transaction;
- * - Source-originated SOP traffic is DMA'd directly into the policy buffer;
- * - automatic GoodCRC is generated in USBPD_IRQHandler() after 30 us and the
- *   received packet is published only after that GoodCRC has physically ended.
+ * - Sink-originated SOP traffic: atomic TX -> TX_END -> immediate RX ->
+ *   Source GoodCRC transaction (PD_Port_TransactSOP()).
+ * - Source-originated SOP traffic: DMA'd straight into the policy buffer;
+ *   auto-GoodCRC is sent in USBPD_IRQHandler() and the packet is published
+ *   only after that GoodCRC has physically ended.
  ******************************************************************************/
 
 #include "debug.h"
@@ -110,24 +109,13 @@ static void pd_port_enter_rx(void)
     s_rx_armed = 1u;
 }
 
-/* --------------------------------------------------------------------------
- * USBPD IRQ
- *
- * This intentionally follows the stable DemoBoard ownership model:
- *
- *   Source packet -> RX DMA directly into PD_Rx_Buf
- *                 -> 30 us
- *                 -> GoodCRC from s_ack_buf
- *                 -> IF_TX_END
- *                 -> message_pending = 1
- *
- * There is no intermediate RX mailbox copy and no PD_PHY_ACK_TX state.
- * -------------------------------------------------------------------------- */
+/* USBPD IRQ - DemoBoard ownership model:
+ *   Source packet -> RX DMA into the policy buffer -> 30 us -> GoodCRC from
+ *   s_ack_buf -> IF_TX_END -> message_pending = 1 (no intermediate mailbox). */
 void USBPD_IRQHandler(void)
 {
     uint8_t status;
 
-    DBG_ISR_BUMP(DBG_ISR_USBPD);
     status = (uint8_t)USBPD->STATUS;
 
     if(status & IF_RX_RESET)
@@ -375,21 +363,9 @@ void PD_Port_SelectCC(PD_Port_CC cc)
         USBPD->CONFIG &= (uint16_t)~(uint16_t)CC_SEL;
 }
 
-/* --------------------------------------------------------------------------
- * Normal SOP sender transaction.
- *
- * This is deliberately synchronous and microsecond-scale.  It is the part of
- * the DemoBoard implementation that is already known to work with the C140:
- *
- *   mask USBPD IRQ
- *   -> SOP TX
- *   -> wait IF_TX_END
- *   -> immediate RX turnaround
- *   -> poll matching Source GoodCRC
- *   -> re-enable USBPD IRQ
- *
- * The same Message ID is kept across retries.
- * -------------------------------------------------------------------------- */
+/* Normal SOP sender transaction: synchronous, microsecond-scale, DemoBoard-
+ * proven.  USBPD IRQ is masked across TX -> RX turnaround -> GoodCRC poll;
+ * retries keep the same Message ID. */
 uint8_t PD_Port_TransactSOP(const uint8_t *buffer,
                             uint8_t length,
                             uint8_t max_attempts)
@@ -550,13 +526,8 @@ uint8_t PD_Port_TransactSOP(const uint8_t *buffer,
     return 0u;
 }
 
-/* --------------------------------------------------------------------------
- * Compatibility API retained for the current Desktop pd_port.h.
- *
- * Normal policy traffic no longer depends on this asynchronous path; pd.c uses
- * PD_Port_TransactSOP().  Keep these entry points so the rest of the project
- * continues to compile while the PHY is being stabilised.
- * -------------------------------------------------------------------------- */
+/* Compatibility API: the policy layer uses PD_Port_TransactSOP(); these entry
+ * points only exist to keep the current pd_port.h surface compiling. */
 uint8_t PD_Port_StartTx(const uint8_t *buffer,
                         uint8_t length,
                         uint8_t expect_goodcrc)
@@ -635,9 +606,8 @@ void PD_Port_ClearTxResult(void)
 
 void PD_Port_Service(void)
 {
-    /* Normal SOP transactions and auto-GoodCRC are now completed entirely in
-     * their timing-critical PHY paths.  No foreground timeout state machine is
-     * required here. */
+    /* SOP transactions and auto-GoodCRC complete inside the PHY paths; no
+     * foreground timeout state machine lives here. */
 }
 
 uint8_t PD_Port_TxBusy(void)

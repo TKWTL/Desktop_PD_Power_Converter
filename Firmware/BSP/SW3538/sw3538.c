@@ -28,6 +28,14 @@ static uint16_t decode_adc12(const uint8_t *bytes)
     return (uint16_t)((uint16_t)bytes[0] | (((uint16_t)bytes[1] & 0x0Fu) << 8));
 }
 
+static uint16_t decode_ilim_ma(uint8_t raw)
+{
+    if(raw & 0x80u)
+        return (uint16_t)(500u + 25u * (uint16_t)(raw & 0x7Fu));
+
+    return (uint16_t)(1000u + 50u * (uint16_t)(raw & 0x7Fu));
+}
+
 static uint8_t adc_force_mask(uint8_t channel)
 {
     switch(channel)
@@ -133,6 +141,61 @@ SW3538_RET SW3538_UnlockForce(SW3538_NOARG)
     SW3538_FUNC_END;
 }
 
+SW3538_RET SW3538_SetPowerLimitW(SW3538_ARGS(uint8_t watts))
+{
+    /* static: value crosses the sub-coroutine yields below (an automatic local
+     * is lost when the function resumes at its saved case label). */
+    static uint16_t current_10ma;
+
+    SW3538_FUNC_BEGIN;
+
+    if(handle == 0 || watts < 18u || watts > 140u)
+    {
+        if(handle != 0)
+            handle->last_io = SW3538_IO_ERROR;
+        SW3538_RETURN_END();
+    }
+
+    /* Reg0x12A/0x12B encode the 20 V PDO current in 10 mA units.
+     * P = 20 V * I => current_10ma = watts * 5. */
+    current_10ma = (uint16_t)watts * 5u;
+
+    /* General write enable followed by extended-register-bank select. */
+    SW3538_SPAWN_IO(SW3538_ByteWrite(&handle->io_pt, handle, SW3538_CTRG_WREN, SW3538_WREN_STEP1));
+    SW3538_SPAWN_IO(SW3538_ByteWrite(&handle->io_pt, handle, SW3538_CTRG_WREN, SW3538_WREN_STEP2));
+    SW3538_SPAWN_IO(SW3538_ByteWrite(&handle->io_pt, handle, SW3538_CTRG_WREN, SW3538_WREN_STEP3));
+    SW3538_SPAWN_IO(SW3538_ByteWrite(&handle->io_pt, handle, SW3538_CTRG_WREN, SW3538_WREN_EXT_BANK));
+
+    /* Reg0x115[4]=0 selects register-controlled system power instead of PSET. */
+    SW3538_SPAWN_IO(SW3538_ByteRead(&handle->io_pt, handle,
+                                     SW3538_XREG_SYS_POWER_SELECT,
+                                     &handle->rxbuf[0]));
+    handle->rxbuf[0] &= (uint8_t)~SW3538_XREG_SYS_PWR_PSET_BIT;
+    SW3538_SPAWN_IO(SW3538_ByteWrite(&handle->io_pt, handle,
+                                      SW3538_XREG_SYS_POWER_SELECT,
+                                      handle->rxbuf[0]));
+
+    /* Preserve the low-bit fields for 9/12/15 V PDO currents in Reg0x12B. */
+    SW3538_SPAWN_IO(SW3538_ByteRead(&handle->io_pt, handle,
+                                     SW3538_XREG_PD_CUR_LO,
+                                     &handle->rxbuf[0]));
+    handle->rxbuf[0] = (uint8_t)((handle->rxbuf[0] & 0x3Fu) |
+                         (uint8_t)((current_10ma & 0x03u) << 6));
+    SW3538_SPAWN_IO(SW3538_ByteWrite(&handle->io_pt, handle,
+                                      SW3538_XREG_PD20_CUR_HI,
+                                      (uint8_t)(current_10ma >> 2)));
+    SW3538_SPAWN_IO(SW3538_ByteWrite(&handle->io_pt, handle,
+                                      SW3538_XREG_PD_CUR_LO,
+                                      handle->rxbuf[0]));
+
+    /* Reg0x180=0 clears address bit 8 and restores normal 0x00..0xFF access. */
+    SW3538_SPAWN_IO(SW3538_ByteWrite(&handle->io_pt, handle,
+                                      SW3538_XREG_BANK_CLEAR, 0u));
+
+    handle->status.configured_power_w = watts;
+    SW3538_FUNC_END;
+}
+
 SW3538_RET SW3538_ADCRead(SW3538_ARGS(uint8_t channel, uint16_t *raw))
 {
     SW3538_FUNC_BEGIN;
@@ -218,6 +281,8 @@ SW3538_RET SW3538_PortStatusLoad(SW3538_NOARG)
     SW3538_FUNC_BEGIN;
     SW3538_SPAWN_IO(SW3538_ByteRead(&handle->io_pt, handle, SW3538_STRG_SYS_STAT0, &handle->status.sys_stat0));
     SW3538_SPAWN_IO(SW3538_ByteRead(&handle->io_pt, handle, SW3538_STRG_SYS_STAT1, &handle->status.sys_stat1));
+    SW3538_SPAWN_IO(SW3538_ByteRead(&handle->io_pt, handle, SW3538_STRG_PT1_ILIM, &handle->status.pt1_ilim_raw));
+    SW3538_SPAWN_IO(SW3538_ByteRead(&handle->io_pt, handle, SW3538_STRG_PT2_ILIM, &handle->status.pt2_ilim_raw));
     SW3538_FUNC_END;
 }
 
@@ -225,12 +290,14 @@ SW3538_RET SW3538_StatusLoad(SW3538_NOARG)
 {
     SW3538_FUNC_BEGIN;
 
-    /* Keep the composite routine flat: nested composite coroutines would need
-     * a second child continuation.  Leaf I/O calls safely reuse io_pt. */
     SW3538_SPAWN_IO(SW3538_ByteRead(&handle->io_pt, handle, SW3538_STRG_REV, &handle->status.version));
+    SW3538_SPAWN_IO(SW3538_ByteRead(&handle->io_pt, handle, SW3538_STRG_PMAX, &handle->status.pmax_w));
+    handle->status.pmax_w &= 0x7Fu;
     SW3538_SPAWN_IO(SW3538_ByteRead(&handle->io_pt, handle, SW3538_STRG_PROTOCOL, &handle->status.protocol));
     SW3538_SPAWN_IO(SW3538_ByteRead(&handle->io_pt, handle, SW3538_STRG_SYS_STAT0, &handle->status.sys_stat0));
     SW3538_SPAWN_IO(SW3538_ByteRead(&handle->io_pt, handle, SW3538_STRG_SYS_STAT1, &handle->status.sys_stat1));
+    SW3538_SPAWN_IO(SW3538_ByteRead(&handle->io_pt, handle, SW3538_STRG_PT1_ILIM, &handle->status.pt1_ilim_raw));
+    SW3538_SPAWN_IO(SW3538_ByteRead(&handle->io_pt, handle, SW3538_STRG_PT2_ILIM, &handle->status.pt2_ilim_raw));
 
     SW3538_FUNC_END;
 }
@@ -243,6 +310,35 @@ const struct SW3538_StatusTypedef *SW3538_GetStatus(const SW3538_Handle *handle)
 uint8_t SW3538_IsOnline(const SW3538_Handle *handle)
 {
     return (handle != 0) ? handle->status.online : 0u;
+}
+
+uint8_t SW3538_GetPortStatus(const SW3538_Handle *handle,
+                             uint8_t port,
+                             SW3538_PortStatus *status)
+{
+    if(handle == 0 || status == 0 || (port != 1u && port != 2u))
+        return 0u;
+
+    status->online = handle->status.online;
+
+    if(port == 1u)
+    {
+        status->path_on =
+            (handle->status.sys_stat0 & SW3538_STRG_SYS_STAT0_PORT1_ON) ? 1u : 0u;
+        status->device_online =
+            (handle->status.sys_stat1 & SW3538_STRG_SYS_STAT1_PORT1_ONLINE) ? 1u : 0u;
+        status->current_limit_ma = decode_ilim_ma(handle->status.pt1_ilim_raw);
+    }
+    else
+    {
+        status->path_on =
+            (handle->status.sys_stat0 & SW3538_STRG_SYS_STAT0_PORT2_ON) ? 1u : 0u;
+        status->device_online =
+            (handle->status.sys_stat1 & SW3538_STRG_SYS_STAT1_PORT2_ONLINE) ? 1u : 0u;
+        status->current_limit_ma = decode_ilim_ma(handle->status.pt2_ilim_raw);
+    }
+
+    return handle->status.online;
 }
 
 uint8_t SW3538_IsProtocolFast(const SW3538_Handle *handle)

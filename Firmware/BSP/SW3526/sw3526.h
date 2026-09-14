@@ -35,6 +35,9 @@ extern "C" {
 #define SW3526_STRG_ADCH                0x3BU
 #define SW3526_STRG_ADCL                0x3CU
 #define SW3526_STRG_POWER               0x68U
+#define SW3526_CTRG_POWER_CONFIG        0xA7U
+#define SW3526_CTRG_FC_CONFIG3          0xABU
+#define SW3526_CTRG_FC_CONFIG3_REG_PWR  0x04U
 
 /* 0x06 protocol indication. */
 #define SW3526_STRG_PROTOCOL_ONLINE          0x80U
@@ -95,6 +98,8 @@ struct SW3526_StatusTypedef
     uint8_t protocol;
     uint8_t sys_stat;
     uint8_t fault;
+    uint8_t power_state;
+    uint8_t configured_power_w;
 
     uint16_t vin_raw;
     uint16_t vout_raw;
@@ -103,6 +108,17 @@ struct SW3526_StatusTypedef
     uint16_t vout_mv;
     uint32_t iout_ma_x10; /* 0.1 mA units; 2.5 mA/bit -> raw*25 */
 };
+
+typedef struct
+{
+    uint8_t online;
+    uint8_t protocol_online;
+    uint8_t high_voltage;
+    uint8_t port_on;
+    uint8_t buck_on;
+    uint8_t fault;
+    uint8_t power_w;
+} SW3526_PortStatus;
 
 typedef struct
 {
@@ -137,8 +153,13 @@ SW3526_RET SW3526_ADCLoad(SW3526_NOARG);
 SW3526_RET SW3526_ProtocolLoad(SW3526_NOARG);
 SW3526_RET SW3526_PortStatusLoad(SW3526_NOARG);
 SW3526_RET SW3526_StatusLoad(SW3526_NOARG);
+/* Valid range: 12..71 W.  The API switches SW3526 to register-based power
+ * setting (Reg0xAB[2]=1) and writes Reg0xA7. */
+SW3526_RET SW3526_SetPowerLimitW(SW3526_ARGS(uint8_t watts));
 
 const struct SW3526_StatusTypedef *SW3526_GetStatus(const SW3526_Handle *handle);
+uint8_t SW3526_GetPortStatus(const SW3526_Handle *handle,
+                             SW3526_PortStatus *status);
 uint8_t SW3526_IsOnline(const SW3526_Handle *handle);
 uint8_t SW3526_IsProtocolOnline(const SW3526_Handle *handle);
 uint8_t SW3526_IsPortOn(const SW3526_Handle *handle);

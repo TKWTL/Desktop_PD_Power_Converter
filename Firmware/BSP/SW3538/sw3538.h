@@ -47,6 +47,16 @@ extern "C" {
 #define SW3538_STRG_NTC_CURR            0x44U
 #define SW3538_CTRG_PD_CMD              0xA7U
 
+/* Extended 0x1xx register bank.  Reg0x10=0x81 selects the bank; while selected,
+ * low addresses 0x15/0x2A/0x2B refer to Reg0x115/0x12A/0x12B.  Writing zero to
+ * low address 0x80 (Reg0x180) clears the high address bit. */
+#define SW3538_WREN_EXT_BANK            0x81U
+#define SW3538_XREG_SYS_POWER_SELECT    0x15U
+#define SW3538_XREG_PD20_CUR_HI         0x2AU
+#define SW3538_XREG_PD_CUR_LO           0x2BU
+#define SW3538_XREG_BANK_CLEAR          0x80U
+#define SW3538_XREG_SYS_PWR_PSET_BIT    0x10U
+
 #define SW3538_WREN_STEP1               0x20U
 #define SW3538_WREN_STEP2               0x40U
 #define SW3538_WREN_STEP3               0x80U
@@ -120,6 +130,10 @@ struct SW3538_StatusTypedef
     uint8_t protocol;
     uint8_t sys_stat0;
     uint8_t sys_stat1;
+    uint8_t pmax_w;
+    uint8_t pt1_ilim_raw;
+    uint8_t pt2_ilim_raw;
+    uint8_t configured_power_w;
 
     uint16_t vin_raw;
     uint16_t vout_raw;
@@ -130,6 +144,14 @@ struct SW3538_StatusTypedef
     uint32_t pt1_iout_ma_x10;
     uint32_t pt2_iout_ma_x10;
 };
+
+typedef struct
+{
+    uint8_t online;
+    uint8_t path_on;
+    uint8_t device_online;
+    uint16_t current_limit_ma;
+} SW3538_PortStatus;
 
 typedef struct
 {
@@ -163,8 +185,14 @@ SW3538_RET SW3538_ADCLoad(SW3538_NOARG);
 SW3538_RET SW3538_ProtocolLoad(SW3538_NOARG);
 SW3538_RET SW3538_PortStatusLoad(SW3538_NOARG);
 SW3538_RET SW3538_StatusLoad(SW3538_NOARG);
+/* Set the register-controlled system/PD power budget through the documented
+ * 20 V PDO current field.  Valid range for this product: 18..140 W. */
+SW3538_RET SW3538_SetPowerLimitW(SW3538_ARGS(uint8_t watts));
 
 const struct SW3538_StatusTypedef *SW3538_GetStatus(const SW3538_Handle *handle);
+uint8_t SW3538_GetPortStatus(const SW3538_Handle *handle,
+                             uint8_t port,
+                             SW3538_PortStatus *status);
 uint8_t SW3538_IsOnline(const SW3538_Handle *handle);
 uint8_t SW3538_IsProtocolFast(const SW3538_Handle *handle);
 uint8_t SW3538_IsPort1On(const SW3538_Handle *handle);

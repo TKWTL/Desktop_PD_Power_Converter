@@ -5,9 +5,10 @@
 ## 目录结构
 
 ```text
-APP/                 入口、任务注册、板级别名 + MiaoUI + 页面函数
-  MiaoUI/            精简菜单/UI 移植,单字体 + 仪表盘/设置/关于 3 个 XBM 图标
-  Pages/             页面函数(Dashboard 仪表盘 `dashboard.c/.h`)
+APP/                 入口、任务注册、功率限制/风扇曲线(`power_limit.c/.h`、`fan_control.c/.h`) + MiaoUI + 页面函数
+  framework/         低功耗状态机与 UI_OFF 休眠(`pm_*.c/.h`,含 Sleep 菜单)
+  MiaoUI/            精简菜单/UI 移植,单字体 + XBM 图标(仪表盘/设置/关于/烧屏/休眠/恐龙)
+  Pages/             页面函数(Dashboard 仪表盘、服务页、`game_dinosaur.c` 小游戏)
 BSP/                 板级启动 + 器件驱动
   SW3538/            硬件 I2C 双口快充控制器驱动
   SW3526/            句柄式双实例快充控制器驱动
@@ -39,8 +40,10 @@ Project/obj/         构建产物(除 `.gitkeep` 外被忽略)
 | `thread_ui` | 10 ms | 启动即点亮屏幕并进入 Dashboard 仪表盘(与 PD 状态无关);按键扫描 + MiaoUI 主循环 |
 | `thread_soft_i2c_service` | 每轮 | 两路软件 I2C 各推进一步 |
 | `thread_i2c_watchdog` | 10 ms | I2C 事务超时检测与总线恢复 |
-| `thread_sw3538` | 500 ms | 状态 + ADC 镜像刷新 |
-| `thread_sw3526_1/2` | 500 ms | 状态 + ADC 镜像刷新(两个独立句柄) |
+| `thread_power_mirror` | 500 ms | SW3538 + 两个 SW3526 的状态/ADC 镜像刷新,并把总功率限制分配给各芯片功率上限 |
+| `thread_gx21m15` | 500 ms | GX21M15U 温度镜像刷新 |
+| `thread_fan` | 500 ms | 自动风扇调速:UVP 停转 / 传感器失效全速 / 40(37)°C 迟滞 + 每 °C +2 |
+| `thread_pm` | 50 ms | 低功耗状态机:`APP/framework`,空闲 1 min → UI_OFF 关屏;按键/插拔/>5 W 唤醒 |
 
 > SPI 显示与硬件 I2C 事务完全由中断推进(DMA1 CH3 / I2C1 EV+ER / DMA1 CH6+CH7),
 > 不再占用调度器线程;无栈协程不保存自动局部变量,
@@ -52,10 +55,8 @@ Project/obj/         构建产物(除 `.gitkeep` 外被忽略)
 > 以及 `PD_WantsFastPoll()`(PD 已 attach:Source_Capabilities → Request 的响应延迟必须留在
 > Source 的 ~24 ms 窗口内;实测 1 ms 休眠粒度会把 5 ms 拉长到 ~31 ms,Source 直接不回 GoodCRC)。
 >
-> 看门狗与卡死诊断:`APP_Tasks_Init()` 末尾使能 IWDG(LSI,约 1–3 s),仅在 `APP_Tasks_Idle()` 每轮刷新。
-> 合作式调度器无法从线程死等中恢复——主循环 600 ms 无推进时,SysTick 钩子里先用轮询 UART 打出
-> `[STUCK] cp=N`(卡死点编号),随后 IWDG 整机复位;下次启动打印 `[RESET] cause: … IWDG` 与
-> `[DBG] checkpoint retained=N`(检查点镜像存于 `.noinit`,堆起点 `_sbrk` 在其后)。编号含义见 `APP/app_tasks.c` 顶部。
+> 看门狗:`APP_Tasks_Init()` 末尾使能 IWDG(LSI,约 1–3 s),仅在 `APP_Tasks_Idle()` 每轮刷新;
+> 卡死后的整机复位可以从下次启动的 `[RESET] cause: … IWDG` 确认。
 
 ## 电源控制器驱动现状
 
@@ -77,6 +78,8 @@ u8g2 只是作为刻意精简的 SH1107 图形依赖回归,不再包含旧的 SS
 
 - PB9 使用原生 TIM1_CH1 输出 187.5 kHz PWM。PSC=0、ARR=255 使 CCR1 与 8 位占空比
   一一对应(0..255 共 256 级);`FAN_PWM_SetDuty8()` 即该量程的唯一接口。
+- 转速由 `thread_fan` 按 `APP/fan_control.c` 的曲线自动控制:UVP 停转、GX21M15U
+  失效全速,平时 40 °C 启动 / 37 °C 停止,之后每升高 1 °C 占空比 +2(启动点 80,静音直跳)。
 - SH1107 使用 SPI1 重映射 10:PA11 SCK、PA10 MOSI、PA12(硬件 NSS 片选)、PA9 D/C。
   SPI 时钟 12 MHz,SPI TX 使用 DMA1 CH3,整帧分页由 DMA 完成中断推进。
 - 0.78 英寸面板由 TK078F288 80×128 原生 u8g2 后端驱动。`U8G2_R1` 得到产品需要的
@@ -97,19 +100,28 @@ u8g2 只是作为刻意精简的 SH1107 图形依赖回归,不再包含旧的 SS
 而是进入 128×80 全屏遥测页(`Dashboard_Page()`,位于 `APP/Pages/dashboard.c`):
 
 ```text
---C 20.0V 140W DC            <- 温度(GX21M15U 未接入,暂占位) / 输入电压 / 功率限制 / PD 状态
+--.-C 20V 270Wmax DC         <- 温度(GX21M15U,离线占位;在线如 25.3C) / 输入电压(整数伏) / 总功率限制 / PD 状态(右对齐)
       A+C       C1      C2 <- 第二行:各块端口名
    20.00V   20.00V   20.00V <- 第三行:输出电压(两位小数)
    1.250A   0.500A   0.000A <- 第四行:输出电流(三位小数)
    25.00W   10.00W    0.00W <- 第五行:输出功率(>=10 W 两位小数,<10 W 三位小数)
-      PPS        PD       ---<- 第六行:协商协议
+      PPS        PD       NC <- 第六行:协商协议(NC 无设备 / 5V 无快充;居中)
 ```
 
 - 行高 12 px + 1 px 间隔:行基线 `y = 12 + 13*(行-1)`;列右边界 43/85/127 px,
   数值右对齐 —— 偏宽的数值占用 1 字符间隙,SW3538 列 7 字符可容下 `139.02W`。
+- **总功率限制**(`APP/power_limit.c`):UVP(输入 < 8 V)固定 `0 W`;PD 固定为合同
+  功率的 95%;DC 下按 DOWN 调节,上电默认 `270 W`(最大值),每次 -10 W,到
+  `60 W` 后回绕到 `270 W`。该值由 `thread_power_mirror` 用于芯片功率分配;
+  第一行显示为 `270Wmax`(数字 3 位右对齐,`W` 与旧 `140Wmax` 同一位置)。
+- PD 状态栏:输入 < 8 V 显示 `UVP`;否则 `EPR/SPR/NEG/DC`(PD 未连接 = `DC`)。
+- 第一行大约 21 字符:温度丢 `'`、电压取整就是为了在 `UVP`/`EPR`(3 字符)时
+  也不溢出(22 字符会被屏幕右边缘截掉最后一字)。
 - 数据全部取自 500 ms 周期的器件镜像,UI 不做 I2C 访问:
   SW3538 列 = 共享 VOUT + A/C 两路电流之和 + 芯片协议;
-  两个 SW3526 列 = 各自的 VOUT/IOUT/协议。芯片离线时该列显示 `---`。
+  两个 SW3526 列 = 各自的 VOUT/IOUT/协议。芯片离线时该列显示 `---`;
+  协议行:未接设备 `NC`、接了但无快充 `5V`,其余显示协议名,文本在列内居中
+  (SW3538 列右移 3 px);第 1 行的 PD 状态右对齐到屏幕右缘。
 - 数值用**定点整数**格式化：真实值 = 缩放整数 / 10^decimals（`%u.%02uV` 这种写法），
   **禁止 `%f`** —— 见下方「Flash 约束与 printf 规则」；
   内容签名不变就不重复刷屏,但 `Disp_GetFlushCount()` 一旦变化(菜单/fade 刷过帧)
@@ -133,33 +145,9 @@ u8g2 只是作为刻意精简的 SH1107 图形依赖回归,不再包含旧的 SS
 - 改完请用 map 复核：库占用（`_`/`__` 开头符号）应只剩 `_write`/`_sbrk` 与少量
   libgcc 移位辅助。
 
-## 复位诊断(2026-09-12 新增黑匣子)
-
-复位后启动日志会多出几行（数据存于 `.noinit`，掉电丢失、复位保留）：
-
-```
-[DBG] checkpoint retained=33        <- 上一次复位时主循环停在哪个代码区
-[DBG] bb: uptime=… ms last_snap=… fault=…   <- 运行多久后复位 / HardFault 次数
-[DBG] bb isr1s: pd=… spi=… ev=… er=…       <- 复位前最后 ~1 秒的各中断入口次数
-[DBG] bb isr1s: i2ctx=… i2crx=… uart=…/…
-```
-
-读法：
-
-| 现象 | 结论 |
-|---|---|
-| 某个 `isr1s` 值异常大（几千以上） | 该外设**中断风暴**（电平触发未清标志）——优先级高于 SysTick 时连 1 ms 节拍都会停，所以不会打 `[STUCK]`。2026-09-12 实测就是 `ev≈10^6/s`：I2C 事件中断风暴（已修，见 `Peripheral/I2C/README.md`） |
-| 全为 0、`beat` 不涨、`fault=0` | 中断被关（PRIMASK）或 CPU 停在某个同步死循环；配合 `[STUCK] cp=` 定位 |
-| `fault>0` | HardFault（日志里还有 `[FAULT]`）——halt 后由 IWDG 复位 |
-| 全部正常、`[STUCK] cp=N` 出现过 | 主循环里同步卡住，查 checkpoint N 对应代码 |
-| 全部正常、也没有 `[STUCK]` | 用 `uptime` 先确认“多久后复位”，再怀疑 WFI/节拍 |
-| 出现 `[DBG] bb i2c: aborts=…` | I2C 事件中断风暴触发了熔断（`star1/star2` 就是当时没清掉的标志：bit0=SB、bit1=ADDR、bit2=BTF、bit4=STOPF） |
-
-`DBG_TickHook()` 每 1024 ms 把中断计数快照一次，所以 `isr1s` 是“最后一秒窗口”。
-新增中断处理时记得在 `APP/ch32x035_it.c` 的中断向量里加 `DBG_ISR_BUMP(…)`。
-
 ## 模块文档
 
+- [`APP/framework/README.md`](APP/framework/README.md) — 低功耗框架(UI_OFF 休眠)
 - [`APP/MiaoUI/README.md`](APP/MiaoUI/README.md) — UI 框架与输入适配
 - [`BSP/Display/README.md`](BSP/Display/README.md) — SH1107 显示 BSP
 - [`BSP/Fan/README.md`](BSP/Fan/README.md) — 风扇 PWM

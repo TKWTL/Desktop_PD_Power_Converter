@@ -14,9 +14,9 @@ extern "C" {
  *   - protocol/policy code must not access USBPD/RCC/GPIO/NVIC registers;
  *   - the MCU-specific implementation owns the timing-critical USBPD vector,
  *     IRQ logic and GoodCRC response directly;
- *   - RX: the USBPD dedicated DMA fills an internal buffer; the frame is
- *     copied into the mailbox passed to PD_Port_Init() after its automatic
- *     GoodCRC has physically finished;
+ *   - RX: the USBPD dedicated DMA fills the buffer passed to PD_Port_Init()
+ *     directly; the packet is published to the policy layer only after its
+ *     automatic GoodCRC has physically finished (no intermediate copy);
  *   - TX: Source-originated RX/auto-GoodCRC remains IRQ-driven; normal
  *     Sink-originated SOP traffic uses a short atomic TX -> RX -> GoodCRC
  *     transaction matching the field-verified DemoBoard/C140 path.

@@ -28,6 +28,7 @@
 #include "display/dispDriver.h"
 #include "indev/indevDriver.h"
 #include "images/image.h"
+#include "Pages/dashboard.h"   /* 图标页顶部复用 dashboard 第一行状态文本 */
 #include "widget/parameter.h"
 #include "widget/text.h"
 #include "stdio.h"
@@ -593,10 +594,10 @@ static uint8_t Draw_ImagePage_Optionbar(ui_t *ui, ui_item_t *now_Item, ui_item_t
     // 使用定点 PID 计算当前的绘制长度
     ui->optionbar.nowLenght = UI_Animation(ui->optionbar.targetLenght, ui->optionbar.nowLenght, &ui->animation.optionbar_ani);
     ui->optionbar.position = UI_Animation(UI_FX(UI_HOR_RES), ui->optionbar.position, &ui->animation.optionbarPos_ani);//实现进入页面时的细线动效
-    // 绘制选项移动的指示线
-    Disp_DrawLine(0, 2, (uint16_t)UI_FXI(ui->optionbar.position), 2);
+    // 绘制选项移动的指示线(整体下移 16px，让出顶部状态行；仅适配 128x80)
+    Disp_DrawLine(0, UI_IMAGE_BAR_Y + 2, (uint16_t)UI_FXI(ui->optionbar.position), UI_IMAGE_BAR_Y + 2);
     // 根据计算出的长度，绘制当前选项的高亮框
-    if(UI_FXI(ui->optionbar.nowLenght) > 3) Disp_DrawRBox(0, 0, (uint16_t)UI_FXI(ui->optionbar.nowLenght), 5, 2);//边的长度必须大于圆角宽度+1，不然会显示异常
+    if(UI_FXI(ui->optionbar.nowLenght) > 3) Disp_DrawRBox(0, UI_IMAGE_BAR_Y, (uint16_t)UI_FXI(ui->optionbar.nowLenght), 5, 2);//边的长度必须大于圆角宽度+1，不然会显示异常
 
     if(UI_IsAnimationDone(ui->optionbar.nowLenght, ui->optionbar.targetLenght) &&
        (ui->optionbar.position == UI_FX(UI_HOR_RES)))
@@ -874,6 +875,10 @@ static void Draw_ImagePage(ui_t *ui, ui_page_t *Page, ui_item_t *nowItem, ui_ite
     ui_item_t * temp_item = Page->item.head; //从页面的头部开始遍历
     uint8_t color = 2;
     Draw_ImagePage_Optionbar(ui, nowItem, next_item);
+
+    /* 顶部状态行:与 dashboard 第一行完全一致(坐标不动)。图标与进度条已
+     * 整体下移 16px 为它让位——仅适配 128x80 逻辑画布。 */
+    Dashboard_DrawStatusLine(ui);
     if(ui->nowItem->page.location != next_item->page.location)
     {
         for (uint16_t i = 0; i <= Page->length; i++)
@@ -890,11 +895,11 @@ static void Draw_ImagePage(ui_t *ui, ui_page_t *Page, ui_item_t *nowItem, ui_ite
             //绘制图标
             color = ui->bgColor^0x01;
             Disp_SetDrawColor(&color);
-            Disp_DrawXBMP((uint16_t)UI_FXI(temp_item->animationX), 12, UI_IMG_WIDTH, UI_IMG_HEIGHT, temp_item->logo);
+            Disp_DrawXBMP((uint16_t)UI_FXI(temp_item->animationX), UI_IMAGE_Y, UI_IMG_WIDTH, UI_IMG_HEIGHT, temp_item->logo);
             //加框并反色图片
             color = 2;
             Disp_SetDrawColor(&color);
-            Disp_DrawRBox((uint16_t)UI_FXI(temp_item->animationX), 12, UI_IMG_WIDTH, UI_IMG_HEIGHT, 4);
+            Disp_DrawRBox((uint16_t)UI_FXI(temp_item->animationX), UI_IMAGE_Y, UI_IMG_WIDTH, UI_IMG_HEIGHT, 4);
         }
 
         temp_item = temp_item->nextItem;
@@ -1277,20 +1282,20 @@ static void AnimationParam_Init(ui_animation_t *Ani)
     Ani->optionbar_ani.ki = 0;
     Ani->optionbar_ani.kd = 31;
 
-    //光标动效参数
-    Ani->cursor_ani.kp = 256;
-    Ani->cursor_ani.ki = 31;
-    Ani->cursor_ani.kd = 20;
+    //光标动效参数(2026-09-14 由 +100% 增速回撤 20%: 0.5/0.061/0.039 → 0.4/0.049/0.031)
+    Ani->cursor_ani.kp = 410;
+    Ani->cursor_ani.ki = 50;
+    Ani->cursor_ani.kd = 32;
 
-    //图片页动效参数
-    Ani->imagePage_ani.kp = 256;
+    //图片页动效参数(同上回撤 20%)
+    Ani->imagePage_ani.kp = 410;
     Ani->imagePage_ani.ki = 0;//必须是0，否则图像到处乱飞
-    Ani->imagePage_ani.kd = 10;
+    Ani->imagePage_ani.kd = 16;
 
-    //文本页动效参数
-    Ani->textPage_ani.kp = 256;
+    //文本页动效参数(同上回撤 20%)
+    Ani->textPage_ani.kp = 410;
     Ani->textPage_ani.ki = 0;//必须是0，否则选项到处乱飞
-    Ani->textPage_ani.kd = 51;
+    Ani->textPage_ani.kd = 82;
 
     //滚动条本体动效参数
     Ani->scrollbar_ani.kp = 256;
