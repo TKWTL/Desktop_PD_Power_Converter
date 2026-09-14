@@ -43,7 +43,8 @@
   `NEG`/`DC`,输入 <8 V 显示 `UVP`,PD 未连接一律 `DC`;状态文本右对齐到屏幕右缘);
 - 第 2~6 行:3 列 = SW3538(A+C 汇总:共享 VOUT、两口电流之和、芯片协议)、
   SW3526#1(`C1`)、SW3526#2(`C2`);每列依次为端口名、输出电压、电流、功率、协议
-  (协议行:未接设备 `NC`、接了但无快充 `5V`、否则协议名;文本在列内居中,
+  (协议行:未接设备 `NC`、接了但无快充 `5V`、否则协议名——PD 固定档 `PD-FIX`、
+  PPS `PD-PPS`;文本在列内居中,
   SW3538 列再右移 3 px);
 - 数值右对齐到列右边界(43/85/127 px);功率 >=10 W 两位小数、<10 W 三位小数
   (普通浮点 printf:MiaoUI 本身已用 `%.2f/%.3f`);
@@ -64,25 +65,36 @@
   先显示说明(约 3 s,任意键跳过),随后整屏涂白用于烧屏观察,任意键返回菜单;
 - 主菜单 `-Dino Game`(`Pages/game_dinosaur.c`,由 NUEDC_2025B Firmware_0 移植):
   小恐龙跑酷——K1(DOWN) 跳/失败后重开、K2(ENTER) 退出且**保留本次进度**
-  (再次进入继续,不重开);16 ms 帧率(每两次页面调用跑一帧),每帧内跑 2 个 8 ms
-  子步:世界/生成倒计时/起跳下落整体快 2 倍(跳跃轨迹与原版同形、滞空减半),
-  而分数仍按原版速率每帧累加一次;仙人掌/云按原版方式直接以(可能为负的)坐标
+  (再次进入继续,不重开);无帧分频,UI 每一拍(8 ms)渲染一帧(上限 ~125 fps,受
+  绘制耗时与刷屏合并影响);模拟独立按 16 ms 定时推进(`DINO_SIM_TICK_MS`,不受
+  绘制耗时影响):每 tick 一个原版 16 ms 步长 + 半个分数步(奇数进位)→ 世界/起跳
+  下落与原版同速(1:1)、分数为原版一半 —— 画面仍每拍重绘,比原版 osDelay(16)
+  循环更顺;仙人掌/云按原版方式直接以(可能为负的)坐标
   交给 u8g2 绘制,可正常滚出左边缘;随机数用本工程自研 `rand()/srand()`
   (以 `TIME_Millis()` 播种);
-- 主菜单 `-Sleep` 图标(低功耗框架,`APP/framework/pm_ui_register.c`):**按下立即关屏**;
-  设置页 `-Sleep`(紧随 `[Home]` 菜单项后)→ `[Sleep]` 页:9 档超时单选
+- **主菜单长按 K2(ENTER) = BACK → 立即休眠**(`core/ui.c` 的 BACK 分支调用
+  `pm_api_force_sleep()`,取代旧的主菜单 `-Sleep` 图标);子菜单/弹窗内长按回到
+  上一级,函数页(dashboard/小恐龙/烧屏)内长按强制退出到菜单;
+- 设置页 `-Sleep`(紧随 `[Home]` 菜单项后)→ `[Sleep]` 页:9 档超时单选
   (No Auto Sleep…30min,默认 1 min);休眠由 `thread_pm` 推进,详见 `APP/framework/README.md`;
 - 设置页(紧跟在显示类设置项之后,由 `Add_Service_Items()` 注册):
-  - ` Soft Reset`:`Board_SoftReset()`(PFIC 软件复位,BOOT_MODE 不动);
+  - ` Fan +10C`(`UI_ITEM_DATA`/`UI_DATA_SWITCH`,K2 直接翻转,数值列显示勾选框):
+    风扇触发点/停止点整体 +10 °C(40/37 → 50/47 °C),回调
+    `FAN_Control_SetTemperatureDelay()`;设置只存内存(与其它设置一致),
+    `thread_fan` 在下一次 500 ms 轮询生效;
+  - ` Reset Now`:`Board_SoftReset()`(PFIC 软件复位,BOOT_MODE 不动);
   - ` Reboot to ISP`:`Board_RebootToISP()`(下一次复位进入 CH32 出厂 USB ISP);
   - 临时 `Fan Test` 项已于 2026-09-14 删除:风扇改由 `thread_fan` 按
-    `APP/fan_control.c` 的曲线自动调速,后续 UI 只保留"延后风扇触发点"设置
-    (调用 `FAN_Control_SetTemperatureDelay()`)。
+    `APP/fan_control.c` 的曲线自动调速。
 
 ## 输入约定
 
 刻意只用两键:K1 = DOWN(页面导航;在数值编辑弹窗内递增数值),
-K2 = ENTER/确认。Dashboard 页内 K1 被忽略,按 K2 返回图标菜单。
+K2 = ENTER/确认 **抬起触发**(`indevScan()` 在 K2 松开时才发 ENTER,按住不会连发),
+**长按(1 s,键仍按住时)发一次 UI_BACK**:子菜单/弹窗回到上一级、根菜单立即休眠;
+长按过的那次按下的松开不会再触发 ENTER。唤醒用的那次按下属于电源框架
+(UI_OFF 期间不跑 `indevScan()`,不受抬起触发影响),其松开不会误触发页面上的 ENTER。
+Dashboard 页内 K1 被忽略,按 K2(短按)返回图标菜单,长按同样返回(强制退出)。
 
 ## 注意事项
 

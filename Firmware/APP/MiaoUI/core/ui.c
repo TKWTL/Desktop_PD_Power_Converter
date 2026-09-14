@@ -34,9 +34,7 @@
 #include "stdio.h"
 #include "stdlib.h"
 #include "string.h"
-#if PM_FEATURE_ENABLE
-#include "pm_api.h"
-#endif
+#include "framework/pm_api.h"   /* 根菜单 BACK → pm_api_force_sleep() */
 
 //禁用调试输出定义函数
 void disable_logging(const char *s){
@@ -1086,13 +1084,13 @@ static void Process_UI_Run(ui_t *ui, UI_ACTION Action)
                             ui->oldItem = ui->nowItem->page.location->item.head;
                             ui->nowItem = ui->nowItem->page.location->parentPage->item.lastJumpItem;
                         }
-#if PM_FEATURE_ENABLE
                         else{
-                            /* 根菜单按 BACK → 触发休眠/关屏 */
+                            /* 根菜单按 BACK(K2 长按) → 立即休眠/关屏:独立的
+                             * "-Sleep" 图标已删,这里是菜单里关屏的唯一入口。
+                             * 电源框架在下一次 poll(≤50 ms)进入 UI_OFF,随后
+                             * thread_ui 停画(coroOS 下无需挂起任务)。 */
                             pm_api_force_sleep();
-                            vTaskSuspend(NULL);   /* 自挂起，避免继续绘图 */
                         }
-#endif
                     }
                     else{ // 否则进入应用绘制状态
                         UI_Disapper(ui, 1);
@@ -1193,6 +1191,10 @@ static void Process_App_Run(ui_t *ui, ui_item_t *item, UI_ACTION Action)
     case UI_ITEM_WORD://显示字符串
         if (item->itemFunction == NULL) Text_Widget(ui);
         else (item->itemFunction)(ui);
+        /* BACK(K2 长按)强制离开函数页:dashboard/小恐龙/烧屏页都只是被菜单
+         * 调用的绘制函数,页面本身若吞掉了该 action(如烧屏说明页),这里重新
+         * 置回,保证"长按=回到上一级"。 */
+        if(Action == UI_ACTION_BACK) ui->action = UI_ACTION_BACK;
         if(ui->action != UI_ACTION_NONE) Change_UIState(ui, UI_ITEM_EXIT); // 如果项目状态为进入菜单，则改变菜单状态为函数退出
         break;
     case UI_ITEM_ONCE_FUNCTION:

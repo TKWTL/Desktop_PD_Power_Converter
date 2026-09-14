@@ -30,3 +30,22 @@
 *.xlsx binary
 *.doc  binary
 *.docx binary
+
+# LCEDA / EasyEDA Pro project files are ZIP containers, not text: keep them
+# byte-exact and never diff them as text (Hardware/source/ProPrj_*.epro2).
+*.epro2 binary
+*.epro  binary
+*.eprj  binary
+
+# Archives and mechanical exports that may follow the first manufacturing
+# package (the Gerber *.zip and schematic *.pdf under Hardware/ are already
+# covered by the generic rules above).
+*.rar  binary
+*.7z   binary
+*.tar  binary
+*.gz   binary
+*.stl  binary
+*.step binary
+*.stp  binary
+*.3mf  binary
+*.dxf  binary

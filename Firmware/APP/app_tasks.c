@@ -5,6 +5,7 @@
 #include "power_limit.h"
 #include "fan_control.h"
 #include "framework/pm_api.h"
+#include "framework/pm_sleep_timer.h"
 #include "board.h"
 #include "vbus_sense.h"
 #include "i2c_api.h"
@@ -62,6 +63,7 @@ THRD_DECLARE(thread_vbus)
 {
     static uint16_t mv;
     static uint8_t log_div;
+    static uint32_t sleep_left;
     THRD_BEGIN;
     log_div = 0u;
     while(1)
@@ -73,21 +75,38 @@ THRD_DECLARE(thread_vbus)
         {
             log_div = 0u;
             printf("[VBUS] %u mV\r\n", (unsigned)mv);
+
+            /* Sleep countdown right behind the voltage line (debug aid):
+             * seconds until the framework sleeps, "off" = No Auto Sleep /
+             * countdown stopped, pm_off = 1 once the state machine left RUN
+             * (screen off), left=0 s means the deadline has passed. */
+            sleep_left = pm_sleep_timer_left_ms();
+            if(sleep_left == PM_SLEEP_INFINITE)
+                printf("[PM] sleep left=off pm_off=%u\r\n", (unsigned)pm_api_is_sleeping());
+            else
+                printf("[PM] sleep left=%lu s pm_off=%u\r\n",
+                       (unsigned long)((sleep_left + 999ul) / 1000ul),
+                       (unsigned)pm_api_is_sleeping());
         }
     }
     THRD_END;
 }
 
-#define UI_FRAME_PERIOD_MS         10u
+#define UI_FRAME_PERIOD_MS         8u
 #define UI_KEY_SERVICE_MS          10u
 #define PD_STARTUP_QUIET_WINDOW_MS 1000u
+
+/* Ignore key wake-ups for this long after entering UI_OFF: the press that
+ * requested the sleep (and its release / DAS events) must not light the
+ * screen up again ("manual sleep comes back on immediately"). */
+#define PM_WAKE_ARM_MS             300u
 
 static uint32_t s_app_boot_ms;
 
 /* USB-PD GoodCRC reception is a sub-millisecond timing path.  During initial
  * SPR/EPR negotiation, nonessential display and telemetry traffic can create a
  * dense SPI/I2C/DMA interrupt load.  Keep the first negotiation window quiet;
- * after a valid power contract is ready, all normal UI and 500 ms telemetry
+ * after a valid power contract is ready, all normal UI and 333 ms telemetry
  * work resumes.  If a non-PD/DC source is used, the timeout prevents the UI
  * from being suppressed indefinitely. */
 static uint8_t APP_NoncriticalIOAllowed(void)
@@ -104,34 +123,40 @@ static uint8_t APP_NoncriticalIOAllowed(void)
     return 0u;
 }
 
-/* Key activity for the sleep state: ui_loop() (and with it indevScan()) does
- * not run while the UI is off, so the wake-up path reads the button events
- * directly.  Reading them here is safe - the edges are consumed by the normal
- * indevScan() path only when it runs. */
-static uint8_t app_pm_any_key_activity(void)
+/* Wake request while the UI is off: ui_loop() (and with it indevScan()) does
+ * not run then, so the button events are read directly here.  Only a *fresh*
+ * press may wake the device: the release edge, the DAS repeats of a held key
+ * and the latched KeyState_Release of the key that requested the sleep must
+ * not light the screen up again (that was the "manual sleep comes back on
+ * immediately" bug).  Reading the edge is non-consuming - indevScan() still
+ * sees the event once the UI runs again. */
+static uint8_t app_pm_wake_key_pressed(void)
 {
     uint8_t i;
 
     for(i = 0u; i < (uint8_t)KeyIndex_Max; i++)
     {
-        if((KEY_GetDASClick((KeyIndex_t)i) != 0u) ||
-           (Key_EdgeDetect((KeyIndex_t)i) != KeyEdge_Null))
+        if(Key_EdgeDetect((KeyIndex_t)i) == KeyEdge_Rising)
             return 1u;
     }
 
     return 0u;
 }
 
-/* Non-consuming key check for the awake path: key states/edges are only read,
- * so the events stay available to indevScan().  Every press/hold restarts the
- * idle countdown of the power manager. */
+/* Non-consuming key check for the awake path: every press/hold restarts the
+ * idle countdown of the power manager.  Only ShortPress/LongPress count as
+ * "down" - the driver leaves KeyState_Release latched after the first press
+ * ever (until the next press), and treating that as activity used to refresh
+ * the countdown on every pass (the "countdown stuck at 60 s" bug). */
 static uint8_t app_pm_key_active(void)
 {
     uint8_t i;
+    KeyState_t st;
 
     for(i = 0u; i < (uint8_t)KeyIndex_Max; i++)
     {
-        if((KEY_GetState((KeyIndex_t)i) != KeyState_None) ||
+        st = KEY_GetState((KeyIndex_t)i);
+        if((st == KeyState_ShortPress) || (st == KeyState_LongPress) ||
            (Key_EdgeDetect((KeyIndex_t)i) != KeyEdge_Null))
             return 1u;
     }
@@ -143,6 +168,8 @@ THRD_DECLARE(thread_ui)
 {
     static uint32_t key_service_ms;
     static uint32_t now_ms;
+    static uint32_t pm_sleep_ms;
+    static uint8_t pm_sleep_seen;
 
     THRD_BEGIN;
     diapInit();
@@ -182,21 +209,38 @@ THRD_DECLARE(thread_ui)
         if(pm_api_ui_should_block() || (pm_api_is_unstable_wake() != 0u))
         {
             /* UI_OFF: the display hook already blanked the panel and drawing
-             * stays paused.  A key press is only a wake-up request here - the
+             * stays paused.  A fresh key press is a wake-up request here - the
              * action is swallowed so it cannot also trigger the menu (this
-             * also covers the ~100 ms silence right after a wake). */
-            if(app_pm_any_key_activity() != 0u)
-                pm_api_refresh_idle();
-            ui.action = UI_ACTION_NONE;
-        }
-        else if(APP_NoncriticalIOAllowed())
-        {
-            /* Any key press/hold also counts as activity for the power manager
-             * (the check is non-consuming, see app_pm_key_active()). */
-            if(app_pm_key_active() != 0u)
+             * also covers the ~100 ms silence right after a wake).
+             *
+             * Arming delay: the press that requested the sleep and its
+             * release/DAS events must not wake the device again, so key
+             * wake-ups are ignored for PM_WAKE_ARM_MS after entering UI_OFF. */
+            if(pm_sleep_seen == 0u)
+            {
+                pm_sleep_seen = 1u;
+                pm_sleep_ms = now_ms;
+            }
+
+            if(((uint32_t)(now_ms - pm_sleep_ms) >= PM_WAKE_ARM_MS) &&
+               (app_pm_wake_key_pressed() != 0u))
                 pm_api_refresh_idle();
 
-            ui_loop(&ui);
+            ui.action = UI_ACTION_NONE;
+        }
+        else
+        {
+            pm_sleep_seen = 0u;
+
+            if(APP_NoncriticalIOAllowed())
+            {
+                /* Any key press/hold counts as activity for the power manager
+                 * (the check is non-consuming, see app_pm_key_active()). */
+                if(app_pm_key_active() != 0u)
+                    pm_api_refresh_idle();
+
+                ui_loop(&ui);
+            }
         }
     }
     THRD_END;
@@ -236,7 +280,8 @@ THRD_DECLARE(thread_i2c_watchdog)
     THRD_END;
 }
 
-#define DEVICE_MIRROR_POLL_MS    500u
+#define POWER_MIRROR_POLL_MS     333u   /* SW3538 / SW3526 power telemetry */
+#define TEMP_MIRROR_POLL_MS      500u   /* GX21M15U temperature mirror */
 #define POLL_PHASE_POWER_MS       50u
 #define POLL_PHASE_GX21M15_MS    300u
 #define POLL_PHASE_FAN_MS        100u
@@ -250,7 +295,7 @@ THRD_DECLARE(thread_i2c_watchdog)
  *   - every other chip (attached later or not yet) gets min(its cap, what is
  *     left), so a later load still finds the best available ceiling;
  *   - unplugging releases the reservation automatically - the plan is rebuilt
- *     from scratch on every 500 ms pass.
+ *     from scratch on every power-mirror pass.
  * Shares are clamped into the range each SetPowerLimitW() accepts
  * (SW3538 18..140 W, SW3526 12..71 W) and written only when they change. */
 #define PWR_ALLOC_CHIPS       3u
@@ -266,6 +311,16 @@ static uint8_t s_pwr_alloc_seq;
 static uint8_t s_pwr_alloc_written[PWR_ALLOC_CHIPS];
 static uint8_t s_pwr_alloc_valid[PWR_ALLOC_CHIPS];
 
+/* SW3526 attach detect: a plain Type-C 5 V sink only powers the port switch
+ * (0x07.1 PORT_ON); the protocol-online bit (0x06.7) stays clear until a fast
+ * charge protocol is actually engaged, so both sources are accepted. */
+static uint8_t app_sw3526_attached(const SW3526_Handle *handle)
+{
+    return (uint8_t)((SW3526_IsOnline(handle) &&
+                      (SW3526_IsPortOn(handle) ||
+                       SW3526_IsProtocolOnline(handle))) ? 1u : 0u);
+}
+
 static uint8_t app_power_attached(uint8_t chip)
 {
     if(chip == 0u)
@@ -276,13 +331,9 @@ static uint8_t app_power_attached(uint8_t chip)
     }
 
     if(chip == 1u)
-    {
-        return (uint8_t)((SW3526_IsOnline(&s_sw3526_1) &&
-                          SW3526_IsProtocolOnline(&s_sw3526_1)) ? 1u : 0u);
-    }
+        return app_sw3526_attached(&s_sw3526_1);
 
-    return (uint8_t)((SW3526_IsOnline(&s_sw3526_2) &&
-                      SW3526_IsProtocolOnline(&s_sw3526_2)) ? 1u : 0u);
+    return app_sw3526_attached(&s_sw3526_2);
 }
 
 static uint8_t app_power_cap_w(uint8_t chip)
@@ -432,7 +483,7 @@ THRD_DECLARE(thread_power_mirror)
                        (unsigned)w0, (unsigned)w1, (unsigned)w2);
             }
         }
-        THRD_DELAY(DEVICE_MIRROR_POLL_MS);
+        THRD_DELAY(POWER_MIRROR_POLL_MS);
     }
     THRD_END;
 }
@@ -445,7 +496,7 @@ THRD_DECLARE(thread_gx21m15)
     {
         if(APP_NoncriticalIOAllowed())
             THRD_SPAWN_ARGS(GX21M15_TemperatureLoad, &s_gx21m15);
-        THRD_DELAY(DEVICE_MIRROR_POLL_MS);
+        THRD_DELAY(TEMP_MIRROR_POLL_MS);
     }
     THRD_END;
 }
@@ -528,7 +579,7 @@ THRD_DECLARE(thread_fan)
 #define POLL_PHASE_PM_MS     200u
 #define PM_ACTIVITY_POWER_MW 5000u
 
-/* Total output power from the 500 ms mirrors (same integer math as the
+/* Total output power from the 333 ms power mirrors (same integer math as the
  * dashboard: SW3538 column = shared VOUT x both port currents). */
 static uint32_t app_output_power_mw(void)
 {
@@ -563,9 +614,9 @@ static uint8_t app_power_activity_signature(void)
         sig |= 0x04u;
     if(SW3538_IsPort2DeviceOnline(&s_sw3538))
         sig |= 0x08u;
-    if(SW3526_IsProtocolOnline(&s_sw3526_1))
+    if(app_sw3526_attached(&s_sw3526_1))
         sig |= 0x10u;
-    if(SW3526_IsProtocolOnline(&s_sw3526_2))
+    if(app_sw3526_attached(&s_sw3526_2))
         sig |= 0x20u;
 
     return sig;

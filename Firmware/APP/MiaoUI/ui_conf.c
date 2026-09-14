@@ -57,7 +57,8 @@ void Create_MenuTree(ui_t *ui)
         Add_Disp_Items(&s_settings_page);
         Add_Service_Items(&s_settings_page);
 
-    PM_UI_AddSleepNowItem(&s_main_page);
+    /* No "-Sleep" icon any more: the root menu answers BACK (long press of
+     * ENTER) with pm_api_force_sleep(), see Process_UI_Run() in core/ui.c. */
 
     AddItem("-Burn-in Test", UI_ITEM_WORD, img_burn_in,
             &s_burnin_item, &s_main_page, 0, Burnin_Page);

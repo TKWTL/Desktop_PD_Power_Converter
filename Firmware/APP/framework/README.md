@@ -30,7 +30,7 @@
 | `pm_sleep_timer.c/.h` | 空闲倒计时(No Auto Sleep = `disable()`;手动休眠 = `force_expire()`) |
 | `pm_api.c/.h` | 应用接口:`pm_api_poll()/refresh_idle()/force_sleep()/set_sleep_timeout()/ui_should_block()` |
 | `pm_device_builtin.c` | OLED 钩子:UI_OFF 关屏(`Disp_SetPowerSave(1)`)、唤醒亮屏 + 重绘 |
-| `pm_ui_register.c/.h` | MiaoUI:主菜单 `-Sleep` **图标=按下立即关屏**;设置页 `-Sleep`(紧随菜单项)→ `[Sleep]` 页(9 档超时单选) |
+| `pm_ui_register.c/.h` | MiaoUI:设置页 `-Sleep`(紧随菜单项)→ `[Sleep]` 页(9 档超时单选);主菜单立即休眠改为**根菜单长按 K2=UI_BACK → `pm_api_force_sleep()`**(`core/ui.c`;旧 `-Sleep` 图标已删) |
 
 ## 行为
 

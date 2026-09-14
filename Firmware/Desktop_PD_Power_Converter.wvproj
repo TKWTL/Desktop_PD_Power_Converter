@@ -41,7 +41,7 @@
 					"output_prefix": "",
 					"artifact_type": "Executable"
 				},
-				"parallelizationNumber": "optimal",
+				"parallelizationNumber": "unlimited",
 				"stop_on_first_build_error": true,
 				"pre_script": "",
 				"pre_script_description": "",

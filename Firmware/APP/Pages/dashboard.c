@@ -1,8 +1,8 @@
 /* Dashboard page for the Desktop PD Power Converter.
  *
  * This is the function page the UI boots into.  It is a pure consumer of the
- * 500 ms device mirrors: the UI never touches I2C itself, so the page only
- * formats cached telemetry.
+ * device mirrors (333 ms power telemetry, 500 ms temperature): the UI never
+ * touches I2C itself, so the page only formats cached telemetry.
  *
  * Layout (128x80 panel, 6x12 font, 21 characters per line):
  *   row 1              board input state: temperature ("25.3C") / input voltage
@@ -145,17 +145,17 @@ static const char *dash_protocol_sw3538(uint8_t protocol)
 {
     switch(protocol)
     {
-        case SW3538_PROTOCOL_QC2:       return "QC2";
-        case SW3538_PROTOCOL_QC3:       return "QC3";
+        case SW3538_PROTOCOL_QC2:       return "QC2.0";
+        case SW3538_PROTOCOL_QC3:       return "QC3.0";
         case SW3538_PROTOCOL_QC3P:      return "QC3+";
         case SW3538_PROTOCOL_FCP:       return "FCP";
         case SW3538_PROTOCOL_SCP:       return "SCP";
-        case SW3538_PROTOCOL_PD_FIXED:  return "PD";
-        case SW3538_PROTOCOL_PD_PPS:    return "PPS";
+        case SW3538_PROTOCOL_PD_FIXED:  return "PD-FIX";
+        case SW3538_PROTOCOL_PD_PPS:    return "PD-PPS";
         case SW3538_PROTOCOL_PE11:      return "PE1.1";
         case SW3538_PROTOCOL_PE20:      return "PE2.0";
-        case SW3538_PROTOCOL_VOOC10:    return "VOOC";
-        case SW3538_PROTOCOL_VOOC40:    return "VOOC";
+        case SW3538_PROTOCOL_VOOC10:    return "VOOC1";
+        case SW3538_PROTOCOL_VOOC40:    return "VOOC4";
         case SW3538_PROTOCOL_SFCP:      return "SFCP";
         case SW3538_PROTOCOL_AFC:       return "AFC";
         case SW3538_PROTOCOL_TFCP:      return "TFCP";
@@ -167,12 +167,12 @@ static const char *dash_protocol_sw3526(uint8_t protocol)
 {
     switch(protocol)
     {
-        case SW3526_PROTOCOL_QC2:       return "QC2";
-        case SW3526_PROTOCOL_QC3:       return "QC3";
+        case SW3526_PROTOCOL_QC2:       return "QC2.0";
+        case SW3526_PROTOCOL_QC3:       return "QC3.0";
         case SW3526_PROTOCOL_FCP:       return "FCP";
         case SW3526_PROTOCOL_SCP:       return "SCP";
-        case SW3526_PROTOCOL_PD_FIXED:  return "PD";
-        case SW3526_PROTOCOL_PD_PPS:    return "PPS";
+        case SW3526_PROTOCOL_PD_FIXED:  return "PD-FIX";
+        case SW3526_PROTOCOL_PD_PPS:    return "PD-PPS";
         case SW3526_PROTOCOL_PE11:      return "PE1.1";
         case SW3526_PROTOCOL_PE20:      return "PE2.0";
         case SW3526_PROTOCOL_VOOC:      return "VOOC";
@@ -233,7 +233,12 @@ static void dash_fill_sw3526(dash_column_t *col, SW3526_Handle *handle, const ch
         /* The protocol register carries the type in the low nibble; the raw
          * byte must be masked (SW3526_GetProtocol) or the online/high-voltage
          * bits make every lookup fall through to "---". */
-        if(!SW3526_IsProtocolOnline(handle))
+        /* A plain Type-C sink draws the default 5 V without engaging any fast
+         * charge protocol: 0x06.7 (protocol online) stays clear while the port
+         * switch is on (0x07.1, PORT_ON).  Treating "no protocol" as "no
+         * device" made a working 5 V load read NC, so a sink counts as
+         * attached when the port is on (or a protocol is engaged). */
+        if(!SW3526_IsPortOn(handle) && !SW3526_IsProtocolOnline(handle))
             col->protocol = DASH_PORT_NC_TEXT;
         else if(SW3526_GetProtocol(handle) == SW3526_PROTOCOL_NONE)
             col->protocol = DASH_PORT_5V_TEXT;

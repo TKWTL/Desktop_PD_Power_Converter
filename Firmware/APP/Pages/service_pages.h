@@ -1,5 +1,5 @@
-/* Service items/pages for the Desktop PD Power Converter: fan PWM test,
- * software reset, ISP handoff and the OLED burn-in test.
+/* Service items/pages for the Desktop PD Power Converter: fan trigger delay,
+ * the reset/ISP actions and the OLED burn-in test.
  * Lives outside APP/MiaoUI on purpose: ui_conf.c only owns the menu tree. */
 #ifndef APP_PAGES_SERVICE_PAGES_H_
 #define APP_PAGES_SERVICE_PAGES_H_
@@ -10,8 +10,8 @@
 extern "C" {
 #endif
 
-/* Settings-page entries, added directly (no "Tools" submenu): the fan speed
- * test as a live PWM data item, then the two reset actions. */
+/* Settings-page entries, added directly (no "Tools" submenu): the fan trigger
+ * delay switch first, then the two reset actions. */
 void Add_Service_Items(ui_page_t *parent_page);
 
 /* Full-screen OLED burn-in test: short explanation, then a white screen; any
@@ -19,7 +19,7 @@ void Add_Service_Items(ui_page_t *parent_page);
 void Burnin_Page(ui_t *ui);
 
 /* Reset actions used as function items on the settings page.  Neither ever
- * returns: Soft Reset restarts the application, Reboot to ISP hands over to
+ * returns: Reset Now restarts the application, Reboot to ISP hands over to
  * the CH32 factory bootloader on the next reset. */
 void SoftReset_Action(ui_t *ui);
 void IspReboot_Action(ui_t *ui);

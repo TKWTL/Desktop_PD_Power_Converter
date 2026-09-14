@@ -26,3 +26,17 @@ Do not put `printf`, I2C transactions, UI rendering, scheduler yields or
 millisecond delays inside the sender-response critical path in `Peripheral/PD`.
 The port keeps SOP TX, immediate RX turnaround and GoodCRC observation atomic
 for this reason.
+
+## Deliberately not carried over
+
+The DemoBoard also supported modules that this hardware does not have; they
+were removed instead of being left as dead code:
+
+- INA226 input monitor (replaced by the PA7 ADC divider above);
+- SSD1306 support and the old I2C OLED / u8g2 glue (the actual panel is a
+  0.78" SH1107 over SPI, implemented as its own BSP/display + u8g2 layer);
+- WS2812 LED support;
+- the project-specific PIOC runtime and its 4 KiB SRAM reservation.
+
+The OLED VPP rail is provided by the board, so the SH1107 internal charge pump
+stays off (`0xAD, 0x8A` in the init sequence).

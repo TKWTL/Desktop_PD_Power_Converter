@@ -49,7 +49,8 @@ Project
    detection, bus recovery and the rare deferred START when the bus was busy.
 5. Both software-I2C handles advance one timing edge/state per scheduler pass.
    GPIO-I2C therefore never busy-waits during normal SW3526 transactions.
-6. SW3538 and both SW3526 mirrors are refreshed cooperatively at 500 ms cadence.
+6. SW3538 and both SW3526 mirrors are refreshed cooperatively at a 333 ms
+   cadence (the GX21M15U temperature mirror stays at 500 ms).
 7. Every pass ends in `APP_Tasks_Idle()`: the core executes `WFI` unless a
    software-I2C transfer is in flight (its edges advance once per pass, so a
    1 ms sleep would stretch a byte by two orders of magnitude). The 1 ms
@@ -78,3 +79,20 @@ The SW3538/SW3526 headers intentionally mirror the existing SW6306 style:
 `FLASH->BOOT_MODEKEYR`, set `FLASH_STATR_BOOT_MODE`, clear reset-cause flags and
 issue the keyed PFIC system reset. This reset-based handoff is preferred over a
 direct jump into ROM while PD/I2C/DMA/application state is still active.
+
+## Implemented baseline (moved from the root README)
+
+- USB-PD Sink policy: SPR negotiation plus USB-PD 3.1 EPR entry and the 28 V
+  fixed EPR request path, inherited from the validated DemoBoard stack;
+- nine stackless coroutines (`APP/app_tasks.c`); the SPI display and every
+  hardware-I2C transaction are interrupt driven (DMA1 CH3 page chain, I2C1
+  EV/ER + DMA, GX21M15U shares the I2C1 bus with the SW3538);
+- two independent GPIO soft-I2C buses drive the two fixed-address (0x3c)
+  SW3526 controllers concurrently, each with its own handle/state;
+- USART1 console at 921600 baud (DMA), VBUS on PA7 (75k/6.8k divider, feeds the
+  PD disconnect check), full 20 KiB CPU SRAM (no PIOC reservation);
+- `Board_RebootToISP()` jumps to the CH32 factory ISP on the next reset;
+- MiaoUI (logical 128x80, R1/R3) with dashboard/menu/service pages and the
+  UI_OFF low-power framework in `APP/framework`;
+- removed modules are not placeholders: INA226, SSD1306, WS2812 and PIOC are
+  absent from this hardware - see `Docs/PORTING_NOTES.md`.

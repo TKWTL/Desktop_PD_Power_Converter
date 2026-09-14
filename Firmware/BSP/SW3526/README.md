@@ -24,4 +24,4 @@
 
 - 运行时 I/O 全部走 `Peripheral/SoftI2C` 非阻塞状态机,协程友好;
 - 同一 `SW3526_Handle` 上同一时刻只允许一个顶层协程操作;不同句柄互相独立;
-- 上层目前按 500 ms 周期调用 `SW3526_StatusLoad()` / `SW3526_ADCLoad()` 刷新镜像。
+- 上层目前按 333 ms 周期调用 `SW3526_StatusLoad()` / `SW3526_ADCLoad()` 刷新镜像。

@@ -1,5 +1,8 @@
 /* Sleep menu of the power framework (see pm_ui_register.h).
  *
+ * "Sleep now" is not an icon any more: the root menu answers BACK (the long
+ * press of ENTER) with pm_api_force_sleep(), see core/ui.c's Process_UI_Run.
+ *
  * The radio group uses the MiaoUI convention min == 1 (radio) + max == group
  * id; Switch_Widget() zeroes every entry of the group and sets the clicked
  * one before calling the shared callback, so the callback only has to find
@@ -8,7 +11,6 @@
 #include "pm_ui_register.h"
 
 #include "framework/pm_api.h"
-#include "images/image.h"
 
 #define PM_UI_DEFAULT_OPTION  3u   /* " 1min" */
 #define PM_UI_OPTION_COUNT    9u
@@ -26,20 +28,10 @@ static const int s_opt_seconds[PM_UI_OPTION_COUNT] = {
 static ui_page_t s_sleep_page;
 static ui_item_t s_sleep_menu_item;   /* "-Sleep" on the settings text page */
 static ui_item_t s_sleep_back_item;   /* "[Home]" return to the settings page */
-static ui_item_t s_sleep_now_item;    /* "-Sleep" icon on the main page */
 static ui_item_t s_opt_item[PM_UI_OPTION_COUNT];
 static ui_data_t s_opt_data[PM_UI_OPTION_COUNT];
 static ui_element_t s_opt_elem[PM_UI_OPTION_COUNT];
 static uint8_t s_opt_state[PM_UI_OPTION_COUNT];
-
-/* One-shot action: the state machine enters UI_OFF on the next poll (<= 50 ms)
- * and UI_ITEM_ONCE_FUNCTION returns to the menu by itself, so the item can
- * never re-trigger after the wake-up. */
-static void pm_ui_sleep_now(ui_t *ui)
-{
-    (void)ui;
-    pm_api_force_sleep();
-}
 
 static void pm_ui_option_clicked(ui_t *ui)
 {
@@ -57,18 +49,6 @@ static void pm_ui_option_clicked(ui_t *ui)
     }
 }
 
-/* Main icon page: "-Sleep" acts directly - pressing it turns the screen off
- * immediately (one-shot item, so the wake-up key cannot re-trigger it). */
-void PM_UI_AddSleepNowItem(ui_page_t *main_page)
-{
-    if (main_page == 0) {
-        return;
-    }
-
-    AddItem("-Sleep", UI_ITEM_ONCE_FUNCTION, img_sleep,
-            &s_sleep_now_item, main_page, 0, pm_ui_sleep_now);
-}
-
 /* Settings page: sleep settings entry (placed right after the menu item) with
  * its own "[Sleep]" text page holding the timeout radio group. */
 void PM_UI_AddSleepSettingsItems(ui_page_t *settings_page)
@@ -81,7 +61,7 @@ void PM_UI_AddSleepSettingsItems(ui_page_t *settings_page)
 
     s_opt_state[PM_UI_DEFAULT_OPTION] = 1u;
 
-    AddItem("-Sleep", UI_ITEM_PARENTS, 0, &s_sleep_menu_item,
+    AddItem("-Sleep Options", UI_ITEM_PARENTS, 0, &s_sleep_menu_item,
             settings_page, &s_sleep_page, 0);
     AddPage("[Sleep]", &s_sleep_page, UI_PAGE_TEXT, settings_page);
 

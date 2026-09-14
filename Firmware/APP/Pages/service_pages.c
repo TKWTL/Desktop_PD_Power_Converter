@@ -2,13 +2,15 @@
  *
  * The menu tree (APP/MiaoUI/ui_conf.c) registers them directly; there is no
  * "Tools" submenu:
- *   Soft Reset      Board_SoftReset() - plain PFIC software reset;
+ *   Fan +10C        switch item: shifts the fan thresholds from 40/37 C to
+ *                   50/47 C through FAN_Control_SetTemperatureDelay();
+ *   Reset Now       Board_SoftReset() - plain PFIC software reset;
  *   Reboot to ISP   Board_RebootToISP() - factory bootloader on next reset;
  *   Burn-in Test    full white screen after a short explanation; any key
  *                   during the white phase leaves.
  *
  * Input map is the product's two-key adapter (K1 = DOWN, K2 = ENTER).  Page
- * functions are pass-based: ui_loop() calls them every ~10 ms, actions arrive
+ * functions are pass-based: ui_loop() calls them every ~8 ms, actions arrive
  * in ui->action, and the page either swallows an action (ui->action =
  * UI_ACTION_NONE) or leaves it set so ui.c returns to the menu - the same
  * convention Dashboard_Page() uses.
@@ -17,10 +19,12 @@
 
 #include "board.h"
 #include "debug.h"
+#include "fan_control.h"
 #include "core/ui.h"
 #include "display/dispDriver.h"
 
-/* Intro dwell before the white screen; the UI task ticks every 10 ms. */
+/* Intro dwell before the white screen; the UI task ticks every 8 ms (the 300
+ * ticks below are therefore about 2.4 s). */
 #define BURNIN_INTRO_TICKS   300u
 
 #define BURNIN_LINE_X        4u
@@ -29,14 +33,48 @@
 
 static ui_item_t s_soft_reset_item;
 static ui_item_t s_isp_reboot_item;
+static ui_item_t s_fan_delay_item;
+static uint8_t   s_fan_delay_state;   /* 0 = 40/37 C, 1 = +10 C (50/47 C) */
 
 /* ------------------------------------------------------------------ */
 /* Menu registration                                                  */
 /* ------------------------------------------------------------------ */
 
+/* Fan trigger delay.  The menu item is a plain switch, so the stored flag is
+ * 0/1; the fan curve itself works in degrees and shifts *both* thresholds
+ * (FAN_Control_SetTemperatureDelay: 40/37 C -> 50/47 C).  RAM-only like every
+ * other setting; thread_fan picks the change up on its next 500 ms poll. */
+static void fan_delay_clicked(ui_t *ui)
+{
+    (void)ui;
+    FAN_Control_SetTemperatureDelay((s_fan_delay_state != 0u) ? 10u : 0u);
+}
+
 void Add_Service_Items(ui_page_t *parent_page)
 {
-    AddItem(" Soft Reset", UI_ITEM_WORD, 0, &s_soft_reset_item,
+    static ui_data_t fan_delay_data;
+    static ui_element_t fan_delay_element;
+
+    /* Switch item: K2 toggles it in place and the value column shows a
+     * checkbox, exactly like "Background"/"Screen Flip" on the display page.
+     * Registered first so it sits directly above the reset entries. */
+    s_fan_delay_state = (FAN_Control_GetTemperatureDelay() != 0u) ? 1u : 0u;
+    fan_delay_data.name = "Fan +10C";
+    fan_delay_data.ptr = &s_fan_delay_state;
+    fan_delay_data.function = fan_delay_clicked;
+    fan_delay_data.functionType = UI_DATA_FUNCTION_STEP_EXECUTE;
+    fan_delay_data.dataType = UI_DATA_SWITCH;
+    fan_delay_data.actionType = UI_DATA_ACTION_RW;
+    fan_delay_data.min = 0;      /* 0/0: plain switch, not a radio group */
+    fan_delay_data.max = 0;
+    fan_delay_data.step = 0;
+    fan_delay_data.decimals = 0;
+    fan_delay_element.data = &fan_delay_data;
+    Create_element(&s_fan_delay_item, &fan_delay_element);
+
+    AddItem(" Fan +10'C", UI_ITEM_DATA, 0, &s_fan_delay_item,
+            parent_page, 0, 0);
+    AddItem(" Reset Now", UI_ITEM_WORD, 0, &s_soft_reset_item,
             parent_page, 0, SoftReset_Action);
     AddItem(" Reboot to ISP", UI_ITEM_WORD, 0, &s_isp_reboot_item,
             parent_page, 0, IspReboot_Action);
